@@ -50,7 +50,7 @@
         puzzle with all default settings and forced mobile view.
       </p>
     </div>
-    <Crossword data="{dataNYTMini}" showKeyboard="{true}" />
+    <Crossword data="{dataNYTMini}" showKeyboard={true} />
   </section>
 
   <section id="themes" class="{theme}" style="max-width: 760px;">

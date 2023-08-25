@@ -1,5 +1,5 @@
 
-(function(l, r) { if (l.getElementById('livereloadscript')) return; r = l.createElement('script'); r.async = 1; r.src = '//' + (window.location.host || 'localhost').split(':')[0] + ':35729/livereload.js?snipver=1'; r.id = 'livereloadscript'; l.getElementsByTagName('head')[0].appendChild(r) })(window.document);
+(function(l, r) { if (!l || l.getElementById('livereloadscript')) return; r = l.createElement('script'); r.async = 1; r.src = '//' + (self.location.host || 'localhost').split(':')[0] + ':35729/livereload.js?snipver=1'; r.id = 'livereloadscript'; l.getElementsByTagName('head')[0].appendChild(r) })(self.document);
 var app = (function () {
     'use strict';
 
@@ -30,6 +30,14 @@ var app = (function () {
     }
     function safe_not_equal(a, b) {
         return a != a ? b == b : a !== b || ((a && typeof a === 'object') || typeof a === 'function');
+    }
+    let src_url_equal_anchor;
+    function src_url_equal(element_src, url) {
+        if (!src_url_equal_anchor) {
+            src_url_equal_anchor = document.createElement('a');
+        }
+        src_url_equal_anchor.href = url;
+        return element_src === src_url_equal_anchor.href;
     }
     function is_empty(obj) {
         return Object.keys(obj).length === 0;
@@ -63,12 +71,22 @@ var app = (function () {
         }
         return $$scope.dirty;
     }
-    function update_slot(slot, slot_definition, ctx, $$scope, dirty, get_slot_changes_fn, get_slot_context_fn) {
-        const slot_changes = get_slot_changes(slot_definition, $$scope, dirty, get_slot_changes_fn);
+    function update_slot_base(slot, slot_definition, ctx, $$scope, slot_changes, get_slot_context_fn) {
         if (slot_changes) {
             const slot_context = get_slot_context(slot_definition, ctx, $$scope, get_slot_context_fn);
             slot.p(slot_context, slot_changes);
         }
+    }
+    function get_all_dirty_from_scope($$scope) {
+        if ($$scope.ctx.length > 32) {
+            const dirty = [];
+            const length = $$scope.ctx.length / 32;
+            for (let i = 0; i < length; i++) {
+                dirty[i] = -1;
+            }
+            return dirty;
+        }
+        return -1;
     }
     function null_to_empty(value) {
         return value == null ? '' : value;
@@ -112,14 +130,167 @@ var app = (function () {
         };
     }
 
+    // Track which nodes are claimed during hydration. Unclaimed nodes can then be removed from the DOM
+    // at the end of hydration without touching the remaining nodes.
+    let is_hydrating = false;
+    function start_hydrating() {
+        is_hydrating = true;
+    }
+    function end_hydrating() {
+        is_hydrating = false;
+    }
+    function upper_bound(low, high, key, value) {
+        // Return first index of value larger than input value in the range [low, high)
+        while (low < high) {
+            const mid = low + ((high - low) >> 1);
+            if (key(mid) <= value) {
+                low = mid + 1;
+            }
+            else {
+                high = mid;
+            }
+        }
+        return low;
+    }
+    function init_hydrate(target) {
+        if (target.hydrate_init)
+            return;
+        target.hydrate_init = true;
+        // We know that all children have claim_order values since the unclaimed have been detached if target is not <head>
+        let children = target.childNodes;
+        // If target is <head>, there may be children without claim_order
+        if (target.nodeName === 'HEAD') {
+            const myChildren = [];
+            for (let i = 0; i < children.length; i++) {
+                const node = children[i];
+                if (node.claim_order !== undefined) {
+                    myChildren.push(node);
+                }
+            }
+            children = myChildren;
+        }
+        /*
+        * Reorder claimed children optimally.
+        * We can reorder claimed children optimally by finding the longest subsequence of
+        * nodes that are already claimed in order and only moving the rest. The longest
+        * subsequence of nodes that are claimed in order can be found by
+        * computing the longest increasing subsequence of .claim_order values.
+        *
+        * This algorithm is optimal in generating the least amount of reorder operations
+        * possible.
+        *
+        * Proof:
+        * We know that, given a set of reordering operations, the nodes that do not move
+        * always form an increasing subsequence, since they do not move among each other
+        * meaning that they must be already ordered among each other. Thus, the maximal
+        * set of nodes that do not move form a longest increasing subsequence.
+        */
+        // Compute longest increasing subsequence
+        // m: subsequence length j => index k of smallest value that ends an increasing subsequence of length j
+        const m = new Int32Array(children.length + 1);
+        // Predecessor indices + 1
+        const p = new Int32Array(children.length);
+        m[0] = -1;
+        let longest = 0;
+        for (let i = 0; i < children.length; i++) {
+            const current = children[i].claim_order;
+            // Find the largest subsequence length such that it ends in a value less than our current value
+            // upper_bound returns first greater value, so we subtract one
+            // with fast path for when we are on the current longest subsequence
+            const seqLen = ((longest > 0 && children[m[longest]].claim_order <= current) ? longest + 1 : upper_bound(1, longest, idx => children[m[idx]].claim_order, current)) - 1;
+            p[i] = m[seqLen] + 1;
+            const newLen = seqLen + 1;
+            // We can guarantee that current is the smallest value. Otherwise, we would have generated a longer sequence.
+            m[newLen] = i;
+            longest = Math.max(newLen, longest);
+        }
+        // The longest increasing subsequence of nodes (initially reversed)
+        const lis = [];
+        // The rest of the nodes, nodes that will be moved
+        const toMove = [];
+        let last = children.length - 1;
+        for (let cur = m[longest] + 1; cur != 0; cur = p[cur - 1]) {
+            lis.push(children[cur - 1]);
+            for (; last >= cur; last--) {
+                toMove.push(children[last]);
+            }
+            last--;
+        }
+        for (; last >= 0; last--) {
+            toMove.push(children[last]);
+        }
+        lis.reverse();
+        // We sort the nodes being moved to guarantee that their insertion order matches the claim order
+        toMove.sort((a, b) => a.claim_order - b.claim_order);
+        // Finally, we move the nodes
+        for (let i = 0, j = 0; i < toMove.length; i++) {
+            while (j < lis.length && toMove[i].claim_order >= lis[j].claim_order) {
+                j++;
+            }
+            const anchor = j < lis.length ? lis[j] : null;
+            target.insertBefore(toMove[i], anchor);
+        }
+    }
     function append(target, node) {
         target.appendChild(node);
+    }
+    function get_root_for_style(node) {
+        if (!node)
+            return document;
+        const root = node.getRootNode ? node.getRootNode() : node.ownerDocument;
+        if (root && root.host) {
+            return root;
+        }
+        return node.ownerDocument;
+    }
+    function append_empty_stylesheet(node) {
+        const style_element = element('style');
+        append_stylesheet(get_root_for_style(node), style_element);
+        return style_element.sheet;
+    }
+    function append_stylesheet(node, style) {
+        append(node.head || node, style);
+        return style.sheet;
+    }
+    function append_hydration(target, node) {
+        if (is_hydrating) {
+            init_hydrate(target);
+            if ((target.actual_end_child === undefined) || ((target.actual_end_child !== null) && (target.actual_end_child.parentNode !== target))) {
+                target.actual_end_child = target.firstChild;
+            }
+            // Skip nodes of undefined ordering
+            while ((target.actual_end_child !== null) && (target.actual_end_child.claim_order === undefined)) {
+                target.actual_end_child = target.actual_end_child.nextSibling;
+            }
+            if (node !== target.actual_end_child) {
+                // We only insert if the ordering of this node should be modified or the parent node is not target
+                if (node.claim_order !== undefined || node.parentNode !== target) {
+                    target.insertBefore(node, target.actual_end_child);
+                }
+            }
+            else {
+                target.actual_end_child = node.nextSibling;
+            }
+        }
+        else if (node.parentNode !== target || node.nextSibling !== null) {
+            target.appendChild(node);
+        }
     }
     function insert(target, node, anchor) {
         target.insertBefore(node, anchor || null);
     }
+    function insert_hydration(target, node, anchor) {
+        if (is_hydrating && !anchor) {
+            append_hydration(target, node);
+        }
+        else if (node.parentNode !== target || node.nextSibling != anchor) {
+            target.insertBefore(node, anchor || null);
+        }
+    }
     function detach(node) {
-        node.parentNode.removeChild(node);
+        if (node.parentNode) {
+            node.parentNode.removeChild(node);
+        }
     }
     function destroy_each(iterations, detaching) {
         for (let i = 0; i < iterations.length; i += 1) {
@@ -155,43 +326,133 @@ var app = (function () {
     function children(element) {
         return Array.from(element.childNodes);
     }
-    function claim_element(nodes, name, attributes, svg) {
-        for (let i = 0; i < nodes.length; i += 1) {
-            const node = nodes[i];
-            if (node.nodeName === name) {
-                let j = 0;
-                const remove = [];
-                while (j < node.attributes.length) {
-                    const attribute = node.attributes[j++];
-                    if (!attributes[attribute.name]) {
-                        remove.push(attribute.name);
-                    }
-                }
-                for (let k = 0; k < remove.length; k++) {
-                    node.removeAttribute(remove[k]);
-                }
-                return nodes.splice(i, 1)[0];
-            }
+    function init_claim_info(nodes) {
+        if (nodes.claim_info === undefined) {
+            nodes.claim_info = { last_index: 0, total_claimed: 0 };
         }
-        return svg ? svg_element(name) : element(name);
+    }
+    function claim_node(nodes, predicate, processNode, createNode, dontUpdateLastIndex = false) {
+        // Try to find nodes in an order such that we lengthen the longest increasing subsequence
+        init_claim_info(nodes);
+        const resultNode = (() => {
+            // We first try to find an element after the previous one
+            for (let i = nodes.claim_info.last_index; i < nodes.length; i++) {
+                const node = nodes[i];
+                if (predicate(node)) {
+                    const replacement = processNode(node);
+                    if (replacement === undefined) {
+                        nodes.splice(i, 1);
+                    }
+                    else {
+                        nodes[i] = replacement;
+                    }
+                    if (!dontUpdateLastIndex) {
+                        nodes.claim_info.last_index = i;
+                    }
+                    return node;
+                }
+            }
+            // Otherwise, we try to find one before
+            // We iterate in reverse so that we don't go too far back
+            for (let i = nodes.claim_info.last_index - 1; i >= 0; i--) {
+                const node = nodes[i];
+                if (predicate(node)) {
+                    const replacement = processNode(node);
+                    if (replacement === undefined) {
+                        nodes.splice(i, 1);
+                    }
+                    else {
+                        nodes[i] = replacement;
+                    }
+                    if (!dontUpdateLastIndex) {
+                        nodes.claim_info.last_index = i;
+                    }
+                    else if (replacement === undefined) {
+                        // Since we spliced before the last_index, we decrease it
+                        nodes.claim_info.last_index--;
+                    }
+                    return node;
+                }
+            }
+            // If we can't find any matching node, we create a new one
+            return createNode();
+        })();
+        resultNode.claim_order = nodes.claim_info.total_claimed;
+        nodes.claim_info.total_claimed += 1;
+        return resultNode;
+    }
+    function claim_element_base(nodes, name, attributes, create_element) {
+        return claim_node(nodes, (node) => node.nodeName === name, (node) => {
+            const remove = [];
+            for (let j = 0; j < node.attributes.length; j++) {
+                const attribute = node.attributes[j];
+                if (!attributes[attribute.name]) {
+                    remove.push(attribute.name);
+                }
+            }
+            remove.forEach(v => node.removeAttribute(v));
+            return undefined;
+        }, () => create_element(name));
+    }
+    function claim_element(nodes, name, attributes) {
+        return claim_element_base(nodes, name, attributes, element);
+    }
+    function claim_svg_element(nodes, name, attributes) {
+        return claim_element_base(nodes, name, attributes, svg_element);
     }
     function claim_text(nodes, data) {
-        for (let i = 0; i < nodes.length; i += 1) {
-            const node = nodes[i];
-            if (node.nodeType === 3) {
-                node.data = '' + data;
-                return nodes.splice(i, 1)[0];
+        return claim_node(nodes, (node) => node.nodeType === 3, (node) => {
+            const dataStr = '' + data;
+            if (node.data.startsWith(dataStr)) {
+                if (node.data.length !== dataStr.length) {
+                    return node.splitText(dataStr.length);
+                }
             }
-        }
-        return text(data);
+            else {
+                node.data = dataStr;
+            }
+        }, () => text(data), true // Text nodes should not update last index since it is likely not worth it to eliminate an increasing subsequence of actual elements
+        );
     }
     function claim_space(nodes) {
         return claim_text(nodes, ' ');
     }
-    function set_style(node, key, value, important) {
-        node.style.setProperty(key, value, important ? 'important' : '');
+    function find_comment(nodes, text, start) {
+        for (let i = start; i < nodes.length; i += 1) {
+            const node = nodes[i];
+            if (node.nodeType === 8 /* comment node */ && node.textContent.trim() === text) {
+                return i;
+            }
+        }
+        return nodes.length;
     }
-    function select_option(select, value) {
+    function claim_html_tag(nodes, is_svg) {
+        // find html opening tag
+        const start_index = find_comment(nodes, 'HTML_TAG_START', 0);
+        const end_index = find_comment(nodes, 'HTML_TAG_END', start_index);
+        if (start_index === end_index) {
+            return new HtmlTagHydration(undefined, is_svg);
+        }
+        init_claim_info(nodes);
+        const html_tag_nodes = nodes.splice(start_index, end_index - start_index + 1);
+        detach(html_tag_nodes[0]);
+        detach(html_tag_nodes[html_tag_nodes.length - 1]);
+        const claimed_nodes = html_tag_nodes.slice(1, html_tag_nodes.length - 1);
+        for (const n of claimed_nodes) {
+            n.claim_order = nodes.claim_info.total_claimed;
+            nodes.claim_info.total_claimed += 1;
+        }
+        return new HtmlTagHydration(claimed_nodes, is_svg);
+    }
+    function set_style(node, key, value, important) {
+        if (value == null) {
+            node.style.removeProperty(key);
+        }
+        else {
+            node.style.setProperty(key, value, important ? 'important' : '');
+        }
+    }
+    function select_option(select, value, mounting) {
         for (let i = 0; i < select.options.length; i += 1) {
             const option = select.options[i];
             if (option.__value === value) {
@@ -199,9 +460,12 @@ var app = (function () {
                 return;
             }
         }
+        if (!mounting || value !== undefined) {
+            select.selectedIndex = -1; // no option should be selected
+        }
     }
     function select_value(select) {
-        const selected_option = select.querySelector(':checked') || select.options[0];
+        const selected_option = select.querySelector(':checked');
         return selected_option && selected_option.__value;
     }
     // unfortunately this can't be a constant as that wouldn't be tree-shakeable
@@ -221,21 +485,20 @@ var app = (function () {
         }
         return crossorigin;
     }
-    function add_resize_listener(node, fn) {
+    function add_iframe_resize_listener(node, fn) {
         const computed_style = getComputedStyle(node);
-        const z_index = (parseInt(computed_style.zIndex) || 0) - 1;
         if (computed_style.position === 'static') {
             node.style.position = 'relative';
         }
         const iframe = element('iframe');
-        iframe.setAttribute('style', `display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; ` +
-            `overflow: hidden; border: 0; opacity: 0; pointer-events: none; z-index: ${z_index};`);
+        iframe.setAttribute('style', 'display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; ' +
+            'overflow: hidden; border: 0; opacity: 0; pointer-events: none; z-index: -1;');
         iframe.setAttribute('aria-hidden', 'true');
         iframe.tabIndex = -1;
         const crossorigin = is_crossorigin();
         let unsubscribe;
         if (crossorigin) {
-            iframe.src = `data:text/html,<script>onresize=function(){parent.postMessage(0,'*')}</script>`;
+            iframe.src = "data:text/html,<script>onresize=function(){parent.postMessage(0,'*')}</script>";
             unsubscribe = listen(window, 'message', (event) => {
                 if (event.source === iframe.contentWindow)
                     fn();
@@ -245,6 +508,9 @@ var app = (function () {
             iframe.src = 'about:blank';
             iframe.onload = () => {
                 unsubscribe = listen(iframe.contentWindow, 'resize', fn);
+                // make sure an initial resize event is fired _after_ the iframe is loaded (which is asynchronous)
+                // see https://github.com/sveltejs/svelte/issues/4233
+                fn();
             };
         }
         append(node, iframe);
@@ -261,27 +527,35 @@ var app = (function () {
     function toggle_class(element, name, toggle) {
         element.classList[toggle ? 'add' : 'remove'](name);
     }
-    function custom_event(type, detail) {
+    function custom_event(type, detail, { bubbles = false, cancelable = false } = {}) {
         const e = document.createEvent('CustomEvent');
-        e.initCustomEvent(type, false, false, detail);
+        e.initCustomEvent(type, bubbles, cancelable, detail);
         return e;
     }
     class HtmlTag {
-        constructor(anchor = null) {
-            this.a = anchor;
+        constructor(is_svg = false) {
+            this.is_svg = false;
+            this.is_svg = is_svg;
             this.e = this.n = null;
+        }
+        c(html) {
+            this.h(html);
         }
         m(html, target, anchor = null) {
             if (!this.e) {
-                this.e = element(target.nodeName);
-                this.t = target;
-                this.h(html);
+                if (this.is_svg)
+                    this.e = svg_element(target.nodeName);
+                /** #7364  target for <template> may be provided as #document-fragment(11) */
+                else
+                    this.e = element((target.nodeType === 11 ? 'TEMPLATE' : target.nodeName));
+                this.t = target.tagName !== 'TEMPLATE' ? target : target.content;
+                this.c(html);
             }
             this.i(anchor);
         }
         h(html) {
             this.e.innerHTML = html;
-            this.n = Array.from(this.e.childNodes);
+            this.n = Array.from(this.e.nodeName === 'TEMPLATE' ? this.e.content.childNodes : this.e.childNodes);
         }
         i(anchor) {
             for (let i = 0; i < this.n.length; i += 1) {
@@ -297,8 +571,30 @@ var app = (function () {
             this.n.forEach(detach);
         }
     }
+    class HtmlTagHydration extends HtmlTag {
+        constructor(claimed_nodes, is_svg = false) {
+            super(is_svg);
+            this.e = this.n = null;
+            this.l = claimed_nodes;
+        }
+        c(html) {
+            if (this.l) {
+                this.n = this.l;
+            }
+            else {
+                super.c(html);
+            }
+        }
+        i(anchor) {
+            for (let i = 0; i < this.n.length; i += 1) {
+                insert_hydration(this.t, this.n[i], anchor);
+            }
+        }
+    }
 
-    const active_docs = new Set();
+    // we need to store the information for multiple documents because a Svelte application could also contain iframes
+    // https://github.com/sveltejs/svelte/issues/3624
+    const managed_styles = new Map();
     let active = 0;
     // https://github.com/darkskyapp/string-hash/blob/master/index.js
     function hash(str) {
@@ -307,6 +603,11 @@ var app = (function () {
         while (i--)
             hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
         return hash >>> 0;
+    }
+    function create_style_information(doc, node) {
+        const info = { stylesheet: append_empty_stylesheet(node), rules: {} };
+        managed_styles.set(doc, info);
+        return info;
     }
     function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
         const step = 16.666 / duration;
@@ -317,16 +618,14 @@ var app = (function () {
         }
         const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
         const name = `__svelte_${hash(rule)}_${uid}`;
-        const doc = node.ownerDocument;
-        active_docs.add(doc);
-        const stylesheet = doc.__svelte_stylesheet || (doc.__svelte_stylesheet = doc.head.appendChild(element('style')).sheet);
-        const current_rules = doc.__svelte_rules || (doc.__svelte_rules = {});
-        if (!current_rules[name]) {
-            current_rules[name] = true;
+        const doc = get_root_for_style(node);
+        const { stylesheet, rules } = managed_styles.get(doc) || create_style_information(doc, node);
+        if (!rules[name]) {
+            rules[name] = true;
             stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
         }
         const animation = node.style.animation || '';
-        node.style.animation = `${animation ? `${animation}, ` : ``}${name} ${duration}ms linear ${delay}ms 1 both`;
+        node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
         active += 1;
         return name;
     }
@@ -348,14 +647,13 @@ var app = (function () {
         raf(() => {
             if (active)
                 return;
-            active_docs.forEach(doc => {
-                const stylesheet = doc.__svelte_stylesheet;
-                let i = stylesheet.cssRules.length;
-                while (i--)
-                    stylesheet.deleteRule(i);
-                doc.__svelte_rules = {};
+            managed_styles.forEach(info => {
+                const { ownerNode } = info.stylesheet;
+                // there is no ownerNode if it runs on jsdom.
+                if (ownerNode)
+                    detach(ownerNode);
             });
-            active_docs.clear();
+            managed_styles.clear();
         });
     }
 
@@ -365,32 +663,55 @@ var app = (function () {
     }
     function get_current_component() {
         if (!current_component)
-            throw new Error(`Function called outside component initialization`);
+            throw new Error('Function called outside component initialization');
         return current_component;
     }
+    /**
+     * The `onMount` function schedules a callback to run as soon as the component has been mounted to the DOM.
+     * It must be called during the component's initialisation (but doesn't need to live *inside* the component;
+     * it can be called from an external module).
+     *
+     * `onMount` does not run inside a [server-side component](/docs#run-time-server-side-component-api).
+     *
+     * https://svelte.dev/docs#run-time-svelte-onmount
+     */
     function onMount(fn) {
         get_current_component().$$.on_mount.push(fn);
     }
+    /**
+     * Creates an event dispatcher that can be used to dispatch [component events](/docs#template-syntax-component-directives-on-eventname).
+     * Event dispatchers are functions that can take two arguments: `name` and `detail`.
+     *
+     * Component events created with `createEventDispatcher` create a
+     * [CustomEvent](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent).
+     * These events do not [bubble](https://developer.mozilla.org/en-US/docs/Learn/JavaScript/Building_blocks/Events#Event_bubbling_and_capture).
+     * The `detail` argument corresponds to the [CustomEvent.detail](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent/detail)
+     * property and can contain any type of data.
+     *
+     * https://svelte.dev/docs#run-time-svelte-createeventdispatcher
+     */
     function createEventDispatcher() {
         const component = get_current_component();
-        return (type, detail) => {
+        return (type, detail, { cancelable = false } = {}) => {
             const callbacks = component.$$.callbacks[type];
             if (callbacks) {
                 // TODO are there situations where events could be dispatched
                 // in a server (non-DOM) environment?
-                const event = custom_event(type, detail);
+                const event = custom_event(type, detail, { cancelable });
                 callbacks.slice().forEach(fn => {
                     fn.call(component, event);
                 });
+                return !event.defaultPrevented;
             }
+            return true;
         };
     }
 
     const dirty_components = [];
     const binding_callbacks = [];
-    const render_callbacks = [];
+    let render_callbacks = [];
     const flush_callbacks = [];
-    const resolved_promise = Promise.resolve();
+    const resolved_promise = /* @__PURE__ */ Promise.resolve();
     let update_scheduled = false;
     function schedule_update() {
         if (!update_scheduled) {
@@ -404,22 +725,54 @@ var app = (function () {
     function add_flush_callback(fn) {
         flush_callbacks.push(fn);
     }
-    let flushing = false;
+    // flush() calls callbacks in this order:
+    // 1. All beforeUpdate callbacks, in order: parents before children
+    // 2. All bind:this callbacks, in reverse order: children before parents.
+    // 3. All afterUpdate callbacks, in order: parents before children. EXCEPT
+    //    for afterUpdates called during the initial onMount, which are called in
+    //    reverse order: children before parents.
+    // Since callbacks might update component values, which could trigger another
+    // call to flush(), the following steps guard against this:
+    // 1. During beforeUpdate, any updated components will be added to the
+    //    dirty_components array and will cause a reentrant call to flush(). Because
+    //    the flush index is kept outside the function, the reentrant call will pick
+    //    up where the earlier call left off and go through all dirty components. The
+    //    current_component value is saved and restored so that the reentrant call will
+    //    not interfere with the "parent" flush() call.
+    // 2. bind:this callbacks cannot trigger new flush() calls.
+    // 3. During afterUpdate, any updated components will NOT have their afterUpdate
+    //    callback called a second time; the seen_callbacks set, outside the flush()
+    //    function, guarantees this behavior.
     const seen_callbacks = new Set();
+    let flushidx = 0; // Do *not* move this inside the flush() function
     function flush() {
-        if (flushing)
+        // Do not reenter flush while dirty components are updated, as this can
+        // result in an infinite loop. Instead, let the inner flush handle it.
+        // Reentrancy is ok afterwards for bindings etc.
+        if (flushidx !== 0) {
             return;
-        flushing = true;
+        }
+        const saved_component = current_component;
         do {
             // first, call beforeUpdate functions
             // and update components
-            for (let i = 0; i < dirty_components.length; i += 1) {
-                const component = dirty_components[i];
-                set_current_component(component);
-                update(component.$$);
+            try {
+                while (flushidx < dirty_components.length) {
+                    const component = dirty_components[flushidx];
+                    flushidx++;
+                    set_current_component(component);
+                    update(component.$$);
+                }
+            }
+            catch (e) {
+                // reset dirty state to not end up in a deadlocked state and then rethrow
+                dirty_components.length = 0;
+                flushidx = 0;
+                throw e;
             }
             set_current_component(null);
             dirty_components.length = 0;
+            flushidx = 0;
             while (binding_callbacks.length)
                 binding_callbacks.pop()();
             // then, once components are updated, call
@@ -439,8 +792,8 @@ var app = (function () {
             flush_callbacks.pop()();
         }
         update_scheduled = false;
-        flushing = false;
         seen_callbacks.clear();
+        set_current_component(saved_component);
     }
     function update($$) {
         if ($$.fragment !== null) {
@@ -451,6 +804,16 @@ var app = (function () {
             $$.fragment && $$.fragment.p($$.ctx, dirty);
             $$.after_update.forEach(add_render_callback);
         }
+    }
+    /**
+     * Useful for example to execute remaining `afterUpdate` callbacks before executing `destroy`.
+     */
+    function flush_render_callbacks(fns) {
+        const filtered = [];
+        const targets = [];
+        render_callbacks.forEach((c) => fns.indexOf(c) === -1 ? filtered.push(c) : targets.push(c));
+        targets.forEach((c) => c());
+        render_callbacks = filtered;
     }
 
     let promise;
@@ -502,10 +865,14 @@ var app = (function () {
             });
             block.o(local);
         }
+        else if (callback) {
+            callback();
+        }
     }
     const null_transition = { duration: 0 };
     function create_bidirectional_transition(node, fn, params, intro) {
-        let config = fn(node, params);
+        const options = { direction: 'both' };
+        let config = fn(node, params, options);
         let t = intro ? 0 : 1;
         let running_program = null;
         let pending_program = null;
@@ -515,7 +882,7 @@ var app = (function () {
                 delete_rule(node, animation_name);
         }
         function init(program, duration) {
-            const d = program.b - t;
+            const d = (program.b - t);
             duration *= Math.abs(d);
             return {
                 a: t,
@@ -595,7 +962,7 @@ var app = (function () {
                 if (is_function(config)) {
                     wait().then(() => {
                         // @ts-ignore
-                        config = config();
+                        config = config(options);
                         go(b);
                     });
                 }
@@ -623,27 +990,33 @@ var app = (function () {
     function claim_component(block, parent_nodes) {
         block && block.l(parent_nodes);
     }
-    function mount_component(component, target, anchor) {
-        const { fragment, on_mount, on_destroy, after_update } = component.$$;
+    function mount_component(component, target, anchor, customElement) {
+        const { fragment, after_update } = component.$$;
         fragment && fragment.m(target, anchor);
-        // onMount happens before the initial afterUpdate
-        add_render_callback(() => {
-            const new_on_destroy = on_mount.map(run).filter(is_function);
-            if (on_destroy) {
-                on_destroy.push(...new_on_destroy);
-            }
-            else {
-                // Edge case - component was destroyed immediately,
-                // most likely as a result of a binding initialising
-                run_all(new_on_destroy);
-            }
-            component.$$.on_mount = [];
-        });
+        if (!customElement) {
+            // onMount happens before the initial afterUpdate
+            add_render_callback(() => {
+                const new_on_destroy = component.$$.on_mount.map(run).filter(is_function);
+                // if the component was destroyed immediately
+                // it will update the `$$.on_destroy` reference to `null`.
+                // the destructured on_destroy may still reference to the old array
+                if (component.$$.on_destroy) {
+                    component.$$.on_destroy.push(...new_on_destroy);
+                }
+                else {
+                    // Edge case - component was destroyed immediately,
+                    // most likely as a result of a binding initialising
+                    run_all(new_on_destroy);
+                }
+                component.$$.on_mount = [];
+            });
+        }
         after_update.forEach(add_render_callback);
     }
     function destroy_component(component, detaching) {
         const $$ = component.$$;
         if ($$.fragment !== null) {
+            flush_render_callbacks($$.after_update);
             run_all($$.on_destroy);
             $$.fragment && $$.fragment.d(detaching);
             // TODO null out other refs, including component.$$ (but need to
@@ -660,13 +1033,12 @@ var app = (function () {
         }
         component.$$.dirty[(i / 31) | 0] |= (1 << (i % 31));
     }
-    function init(component, options, instance, create_fragment, not_equal, props, dirty = [-1]) {
+    function init(component, options, instance, create_fragment, not_equal, props, append_styles, dirty = [-1]) {
         const parent_component = current_component;
         set_current_component(component);
-        const prop_values = options.props || {};
         const $$ = component.$$ = {
             fragment: null,
-            ctx: null,
+            ctx: [],
             // state
             props,
             update: noop,
@@ -675,17 +1047,20 @@ var app = (function () {
             // lifecycle
             on_mount: [],
             on_destroy: [],
+            on_disconnect: [],
             before_update: [],
             after_update: [],
-            context: new Map(parent_component ? parent_component.$$.context : []),
+            context: new Map(options.context || (parent_component ? parent_component.$$.context : [])),
             // everything else
             callbacks: blank_object(),
             dirty,
-            skip_bound: false
+            skip_bound: false,
+            root: options.target || parent_component.$$.root
         };
+        append_styles && append_styles($$.root);
         let ready = false;
         $$.ctx = instance
-            ? instance(component, prop_values, (i, ret, ...rest) => {
+            ? instance(component, options.props || {}, (i, ret, ...rest) => {
                 const value = rest.length ? rest[0] : ret;
                 if ($$.ctx && not_equal($$.ctx[i], $$.ctx[i] = value)) {
                     if (!$$.skip_bound && $$.bound[i])
@@ -703,6 +1078,7 @@ var app = (function () {
         $$.fragment = create_fragment ? create_fragment($$.ctx) : false;
         if (options.target) {
             if (options.hydrate) {
+                start_hydrating();
                 const nodes = children(options.target);
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
                 $$.fragment && $$.fragment.l(nodes);
@@ -714,17 +1090,24 @@ var app = (function () {
             }
             if (options.intro)
                 transition_in(component.$$.fragment);
-            mount_component(component, options.target, options.anchor);
+            mount_component(component, options.target, options.anchor, options.customElement);
+            end_hydrating();
             flush();
         }
         set_current_component(parent_component);
     }
+    /**
+     * Base class for Svelte components. Used when dev=false.
+     */
     class SvelteComponent {
         $destroy() {
             destroy_component(this, 1);
             this.$destroy = noop;
         }
         $on(type, callback) {
+            if (!is_function(callback)) {
+                return noop;
+            }
             const callbacks = (this.$$.callbacks[type] || (this.$$.callbacks[type] = []));
             callbacks.push(callback);
             return () => {
@@ -743,45 +1126,47 @@ var app = (function () {
     }
 
     function dispatch_dev(type, detail) {
-        document.dispatchEvent(custom_event(type, Object.assign({ version: '3.29.0' }, detail)));
+        document.dispatchEvent(custom_event(type, Object.assign({ version: '3.59.2' }, detail), { bubbles: true }));
     }
-    function append_dev(target, node) {
-        dispatch_dev("SvelteDOMInsert", { target, node });
-        append(target, node);
+    function append_hydration_dev(target, node) {
+        dispatch_dev('SvelteDOMInsert', { target, node });
+        append_hydration(target, node);
     }
-    function insert_dev(target, node, anchor) {
-        dispatch_dev("SvelteDOMInsert", { target, node, anchor });
-        insert(target, node, anchor);
+    function insert_hydration_dev(target, node, anchor) {
+        dispatch_dev('SvelteDOMInsert', { target, node, anchor });
+        insert_hydration(target, node, anchor);
     }
     function detach_dev(node) {
-        dispatch_dev("SvelteDOMRemove", { node });
+        dispatch_dev('SvelteDOMRemove', { node });
         detach(node);
     }
-    function listen_dev(node, event, handler, options, has_prevent_default, has_stop_propagation) {
-        const modifiers = options === true ? ["capture"] : options ? Array.from(Object.keys(options)) : [];
+    function listen_dev(node, event, handler, options, has_prevent_default, has_stop_propagation, has_stop_immediate_propagation) {
+        const modifiers = options === true ? ['capture'] : options ? Array.from(Object.keys(options)) : [];
         if (has_prevent_default)
             modifiers.push('preventDefault');
         if (has_stop_propagation)
             modifiers.push('stopPropagation');
-        dispatch_dev("SvelteDOMAddEventListener", { node, event, handler, modifiers });
+        if (has_stop_immediate_propagation)
+            modifiers.push('stopImmediatePropagation');
+        dispatch_dev('SvelteDOMAddEventListener', { node, event, handler, modifiers });
         const dispose = listen(node, event, handler, options);
         return () => {
-            dispatch_dev("SvelteDOMRemoveEventListener", { node, event, handler, modifiers });
+            dispatch_dev('SvelteDOMRemoveEventListener', { node, event, handler, modifiers });
             dispose();
         };
     }
     function attr_dev(node, attribute, value) {
         attr(node, attribute, value);
         if (value == null)
-            dispatch_dev("SvelteDOMRemoveAttribute", { node, attribute });
+            dispatch_dev('SvelteDOMRemoveAttribute', { node, attribute });
         else
-            dispatch_dev("SvelteDOMSetAttribute", { node, attribute, value });
+            dispatch_dev('SvelteDOMSetAttribute', { node, attribute, value });
     }
     function set_data_dev(text, data) {
         data = '' + data;
-        if (text.wholeText === data)
+        if (text.data === data)
             return;
-        dispatch_dev("SvelteDOMSetData", { node: text, data });
+        dispatch_dev('SvelteDOMSetData', { node: text, data });
         text.data = data;
     }
     function validate_each_argument(arg) {
@@ -800,27 +1185,30 @@ var app = (function () {
             }
         }
     }
+    /**
+     * Base class for Svelte components with some minor dev-enhancements. Used when dev=true.
+     */
     class SvelteComponentDev extends SvelteComponent {
         constructor(options) {
             if (!options || (!options.target && !options.$$inline)) {
-                throw new Error(`'target' is a required option`);
+                throw new Error("'target' is a required option");
             }
             super();
         }
         $destroy() {
             super.$destroy();
             this.$destroy = () => {
-                console.warn(`Component was already destroyed`); // eslint-disable-line no-console
+                console.warn('Component was already destroyed'); // eslint-disable-line no-console
             };
         }
         $capture_state() { }
         $inject_state() { }
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Toolbar.svelte generated by Svelte v3.29.0 */
-    const file = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Toolbar.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Toolbar.svelte generated by Svelte v3.59.2 */
+    const file$b = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Toolbar.svelte";
 
-    function get_each_context(ctx, list, i) {
+    function get_each_context$5(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[5] = list[i];
     	return child_ctx;
@@ -848,14 +1236,14 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(button, "class", "svelte-e4q29q");
-    			add_location(button, file, 14, 6, 474);
+    			add_location(button, file$b, 14, 6, 474);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, button, anchor);
-    			append_dev(button, t);
+    			insert_hydration_dev(target, button, anchor);
+    			append_hydration_dev(button, t);
 
     			if (!mounted) {
-    				dispose = listen_dev(button, "click", /*click_handler_2*/ ctx[4], false, false, false);
+    				dispose = listen_dev(button, "click", /*click_handler_2*/ ctx[4], false, false, false, false);
     				mounted = true;
     			}
     		},
@@ -879,7 +1267,7 @@ var app = (function () {
     }
 
     // (12:34) 
-    function create_if_block_1(ctx) {
+    function create_if_block_1$3(ctx) {
     	let button;
     	let t;
     	let mounted;
@@ -900,14 +1288,14 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(button, "class", "svelte-e4q29q");
-    			add_location(button, file, 12, 6, 363);
+    			add_location(button, file$b, 12, 6, 363);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, button, anchor);
-    			append_dev(button, t);
+    			insert_hydration_dev(target, button, anchor);
+    			append_hydration_dev(button, t);
 
     			if (!mounted) {
-    				dispose = listen_dev(button, "click", /*click_handler_1*/ ctx[3], false, false, false);
+    				dispose = listen_dev(button, "click", /*click_handler_1*/ ctx[3], false, false, false, false);
     				mounted = true;
     			}
     		},
@@ -921,7 +1309,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_1.name,
+    		id: create_if_block_1$3.name,
     		type: "if",
     		source: "(12:34) ",
     		ctx
@@ -931,7 +1319,7 @@ var app = (function () {
     }
 
     // (10:4) {#if action === 'clear'}
-    function create_if_block(ctx) {
+    function create_if_block$5(ctx) {
     	let button;
     	let t;
     	let mounted;
@@ -952,14 +1340,14 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(button, "class", "svelte-e4q29q");
-    			add_location(button, file, 10, 6, 253);
+    			add_location(button, file$b, 10, 6, 253);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, button, anchor);
-    			append_dev(button, t);
+    			insert_hydration_dev(target, button, anchor);
+    			append_hydration_dev(button, t);
 
     			if (!mounted) {
-    				dispose = listen_dev(button, "click", /*click_handler*/ ctx[2], false, false, false);
+    				dispose = listen_dev(button, "click", /*click_handler*/ ctx[2], false, false, false, false);
     				mounted = true;
     			}
     		},
@@ -973,7 +1361,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block.name,
+    		id: create_if_block$5.name,
     		type: "if",
     		source: "(10:4) {#if action === 'clear'}",
     		ctx
@@ -983,13 +1371,13 @@ var app = (function () {
     }
 
     // (9:2) {#each actions as action}
-    function create_each_block(ctx) {
+    function create_each_block$5(ctx) {
     	let if_block_anchor;
 
     	function select_block_type(ctx, dirty) {
-    		if (/*action*/ ctx[5] === "clear") return create_if_block;
-    		if (/*action*/ ctx[5] === "reveal") return create_if_block_1;
-    		if (/*action*/ ctx[5] === "check") return create_if_block_2;
+    		if (/*action*/ ctx[5] === 'clear') return create_if_block$5;
+    		if (/*action*/ ctx[5] === 'reveal') return create_if_block_1$3;
+    		if (/*action*/ ctx[5] === 'check') return create_if_block_2;
     	}
 
     	let current_block_type = select_block_type(ctx);
@@ -1006,7 +1394,7 @@ var app = (function () {
     		},
     		m: function mount(target, anchor) {
     			if (if_block) if_block.m(target, anchor);
-    			insert_dev(target, if_block_anchor, anchor);
+    			insert_hydration_dev(target, if_block_anchor, anchor);
     		},
     		p: function update(ctx, dirty) {
     			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
@@ -1032,7 +1420,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block.name,
+    		id: create_each_block$5.name,
     		type: "each",
     		source: "(9:2) {#each actions as action}",
     		ctx
@@ -1041,14 +1429,14 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment(ctx) {
+    function create_fragment$b(ctx) {
     	let div;
     	let each_value = /*actions*/ ctx[0];
     	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$5(get_each_context$5(ctx, each_value, i));
     	}
 
     	const block = {
@@ -1074,13 +1462,15 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div, "class", "toolbar svelte-e4q29q");
-    			add_location(div, file, 7, 0, 168);
+    			add_location(div, file$b, 7, 0, 168);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(div, null);
+    				}
     			}
     		},
     		p: function update(ctx, [dirty]) {
@@ -1090,12 +1480,12 @@ var app = (function () {
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context(ctx, each_value, i);
+    					const child_ctx = get_each_context$5(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     					} else {
-    						each_blocks[i] = create_each_block(child_ctx);
+    						each_blocks[i] = create_each_block$5(child_ctx);
     						each_blocks[i].c();
     						each_blocks[i].m(div, null);
     					}
@@ -1118,7 +1508,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment.name,
+    		id: create_fragment$b.name,
     		type: "component",
     		source: "",
     		ctx
@@ -1127,29 +1517,29 @@ var app = (function () {
     	return block;
     }
 
-    function instance($$self, $$props, $$invalidate) {
+    function instance$b($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Toolbar", slots, []);
+    	validate_slots('Toolbar', slots, []);
     	const dispatch = createEventDispatcher();
     	let { actions = ["clear", "reveal", "check"] } = $$props;
-    	const writable_props = ["actions"];
+    	const writable_props = ['actions'];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Toolbar> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Toolbar> was created with unknown prop '${key}'`);
     	});
 
-    	const click_handler = () => dispatch("event", "clear");
-    	const click_handler_1 = () => dispatch("event", "reveal");
-    	const click_handler_2 = () => dispatch("event", "check");
+    	const click_handler = () => dispatch('event', 'clear');
+    	const click_handler_1 = () => dispatch('event', 'reveal');
+    	const click_handler_2 = () => dispatch('event', 'check');
 
     	$$self.$$set = $$props => {
-    		if ("actions" in $$props) $$invalidate(0, actions = $$props.actions);
+    		if ('actions' in $$props) $$invalidate(0, actions = $$props.actions);
     	};
 
     	$$self.$capture_state = () => ({ createEventDispatcher, dispatch, actions });
 
     	$$self.$inject_state = $$props => {
-    		if ("actions" in $$props) $$invalidate(0, actions = $$props.actions);
+    		if ('actions' in $$props) $$invalidate(0, actions = $$props.actions);
     	};
 
     	if ($$props && "$$inject" in $$props) {
@@ -1162,13 +1552,13 @@ var app = (function () {
     class Toolbar extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance, create_fragment, safe_not_equal, { actions: 0 });
+    		init(this, options, instance$b, create_fragment$b, safe_not_equal, { actions: 0 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Toolbar",
     			options,
-    			id: create_fragment.name
+    			id: create_fragment$b.name
     		});
     	}
 
@@ -1529,13 +1919,13 @@ var app = (function () {
 
     var enterSVG = `<svg width="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-corner-down-left"><polyline points="9 10 4 15 9 20"></polyline><path d="M20 4v7a4 4 0 0 1-4 4H4"></path></svg>`;
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/node_modules/svelte-keyboard/src/Keyboard.svelte generated by Svelte v3.29.0 */
-    const file$1 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/node_modules/svelte-keyboard/src/Keyboard.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/node_modules/svelte-keyboard/src/Keyboard.svelte generated by Svelte v3.59.2 */
+    const file$a = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/node_modules/svelte-keyboard/src/Keyboard.svelte";
 
-    function get_each_context_2(ctx, list, i) {
+    function get_each_context$4(ctx, list, i) {
     	const child_ctx = ctx.slice();
-    	child_ctx[31] = list[i].value;
-    	child_ctx[32] = list[i].display;
+    	child_ctx[25] = list[i];
+    	child_ctx[27] = i;
     	return child_ctx;
     }
 
@@ -1545,10 +1935,10 @@ var app = (function () {
     	return child_ctx;
     }
 
-    function get_each_context$1(ctx, list, i) {
+    function get_each_context_2(ctx, list, i) {
     	const child_ctx = ctx.slice();
-    	child_ctx[25] = list[i];
-    	child_ctx[27] = i;
+    	child_ctx[31] = list[i].value;
+    	child_ctx[32] = list[i].display;
     	return child_ctx;
     }
 
@@ -1565,10 +1955,10 @@ var app = (function () {
     			t = claim_text(nodes, t_value);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, t, anchor);
+    			insert_hydration_dev(target, t, anchor);
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*rowData*/ 4 && t_value !== (t_value = /*display*/ ctx[32] + "")) set_data_dev(t, t_value);
+    			if (dirty[0] & /*rowData*/ 8 && t_value !== (t_value = /*display*/ ctx[32] + "")) set_data_dev(t, t_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(t);
@@ -1587,29 +1977,31 @@ var app = (function () {
     }
 
     // (91:14) {#if display.includes('<svg')}
-    function create_if_block$1(ctx) {
+    function create_if_block$4(ctx) {
     	let html_tag;
     	let raw_value = /*display*/ ctx[32] + "";
     	let html_anchor;
 
     	const block = {
     		c: function create() {
+    			html_tag = new HtmlTagHydration(false);
     			html_anchor = empty();
     			this.h();
     		},
     		l: function claim(nodes) {
+    			html_tag = claim_html_tag(nodes, false);
     			html_anchor = empty();
     			this.h();
     		},
     		h: function hydrate() {
-    			html_tag = new HtmlTag(html_anchor);
+    			html_tag.a = html_anchor;
     		},
     		m: function mount(target, anchor) {
     			html_tag.m(raw_value, target, anchor);
-    			insert_dev(target, html_anchor, anchor);
+    			insert_hydration_dev(target, html_anchor, anchor);
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*rowData*/ 4 && raw_value !== (raw_value = /*display*/ ctx[32] + "")) html_tag.p(raw_value);
+    			if (dirty[0] & /*rowData*/ 8 && raw_value !== (raw_value = /*display*/ ctx[32] + "")) html_tag.p(raw_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(html_anchor);
@@ -1619,7 +2011,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block$1.name,
+    		id: create_if_block$4.name,
     		type: "if",
     		source: "(91:14) {#if display.includes('<svg')}",
     		ctx
@@ -1637,20 +2029,21 @@ var app = (function () {
     	let dispose;
 
     	function select_block_type(ctx, dirty) {
-    		if (show_if == null || dirty[0] & /*rowData*/ 4) show_if = !!/*display*/ ctx[32].includes("<svg");
-    		if (show_if) return create_if_block$1;
+    		if (dirty[0] & /*rowData*/ 8) show_if = null;
+    		if (show_if == null) show_if = !!/*display*/ ctx[32].includes('<svg');
+    		if (show_if) return create_if_block$4;
     		return create_else_block;
     	}
 
-    	let current_block_type = select_block_type(ctx, [-1]);
+    	let current_block_type = select_block_type(ctx, [-1, -1]);
     	let if_block = current_block_type(ctx);
 
     	function touchstart_handler(...args) {
-    		return /*touchstart_handler*/ ctx[7](/*value*/ ctx[31], ...args);
+    		return /*touchstart_handler*/ ctx[19](/*value*/ ctx[31], ...args);
     	}
 
     	function mousedown_handler(...args) {
-    		return /*mousedown_handler*/ ctx[8](/*value*/ ctx[31], ...args);
+    		return /*mousedown_handler*/ ctx[20](/*value*/ ctx[31], ...args);
     	}
 
     	const block = {
@@ -1667,19 +2060,19 @@ var app = (function () {
     			this.h();
     		},
     		h: function hydrate() {
-    			set_style(button, "--w", /*percentWidth*/ ctx[3]);
+    			set_style(button, "--w", /*percentWidth*/ ctx[2]);
     			attr_dev(button, "class", button_class_value = "" + (/*style*/ ctx[0] + " key--" + /*value*/ ctx[31] + " svelte-n3ouos"));
     			toggle_class(button, "single", /*value*/ ctx[31].length === 1);
-    			add_location(button, file$1, 84, 12, 2404);
+    			add_location(button, file$a, 84, 12, 2404);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, button, anchor);
+    			insert_hydration_dev(target, button, anchor);
     			if_block.m(button, null);
 
     			if (!mounted) {
     				dispose = [
-    					listen_dev(button, "touchstart", touchstart_handler, false, false, false),
-    					listen_dev(button, "mousedown", mousedown_handler, false, false, false)
+    					listen_dev(button, "touchstart", touchstart_handler, false, false, false, false),
+    					listen_dev(button, "mousedown", mousedown_handler, false, false, false, false)
     				];
 
     				mounted = true;
@@ -1700,15 +2093,15 @@ var app = (function () {
     				}
     			}
 
-    			if (dirty[0] & /*percentWidth*/ 8) {
-    				set_style(button, "--w", /*percentWidth*/ ctx[3]);
+    			if (dirty[0] & /*percentWidth*/ 4) {
+    				set_style(button, "--w", /*percentWidth*/ ctx[2]);
     			}
 
-    			if (dirty[0] & /*style, rowData*/ 5 && button_class_value !== (button_class_value = "" + (/*style*/ ctx[0] + " key--" + /*value*/ ctx[31] + " svelte-n3ouos"))) {
+    			if (dirty[0] & /*style, rowData*/ 9 && button_class_value !== (button_class_value = "" + (/*style*/ ctx[0] + " key--" + /*value*/ ctx[31] + " svelte-n3ouos"))) {
     				attr_dev(button, "class", button_class_value);
     			}
 
-    			if (dirty[0] & /*style, rowData, rowData*/ 5) {
+    			if (dirty[0] & /*style, rowData, rowData*/ 9) {
     				toggle_class(button, "single", /*value*/ ctx[31].length === 1);
     			}
     		},
@@ -1734,7 +2127,6 @@ var app = (function () {
     // (82:6) {#each row as keys}
     function create_each_block_1(ctx) {
     	let div;
-    	let div_class_value;
     	let each_value_2 = /*keys*/ ctx[28];
     	validate_each_argument(each_value_2);
     	let each_blocks = [];
@@ -1765,14 +2157,16 @@ var app = (function () {
     			this.h();
     		},
     		h: function hydrate() {
-    			attr_dev(div, "class", div_class_value = "row row--" + /*i*/ ctx[27] + " svelte-n3ouos");
-    			add_location(div, file$1, 82, 8, 2320);
+    			attr_dev(div, "class", "row row--" + /*i*/ ctx[27] + " svelte-n3ouos");
+    			add_location(div, file$a, 82, 8, 2320);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(div, null);
+    				}
     			}
     		},
     		p: function update(ctx, dirty) {
@@ -1818,7 +2212,7 @@ var app = (function () {
     }
 
     // (80:2) {#each rowData as row, i}
-    function create_each_block$1(ctx) {
+    function create_each_block$4(ctx) {
     	let div;
     	let t;
     	let each_value_1 = /*row*/ ctx[25];
@@ -1855,16 +2249,18 @@ var app = (function () {
     		h: function hydrate() {
     			attr_dev(div, "class", "page svelte-n3ouos");
     			toggle_class(div, "visible", /*i*/ ctx[27] === /*page*/ ctx[1]);
-    			add_location(div, file$1, 80, 4, 2238);
+    			add_location(div, file$a, 80, 4, 2238);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(div, null);
+    				}
     			}
 
-    			append_dev(div, t);
+    			append_hydration_dev(div, t);
     		},
     		p: function update(ctx, dirty) {
     			if (dirty[0] & /*rowData, percentWidth, style, onKey*/ 29) {
@@ -1903,7 +2299,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block$1.name,
+    		id: create_each_block$4.name,
     		type: "each",
     		source: "(80:2) {#each rowData as row, i}",
     		ctx
@@ -1912,14 +2308,14 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$1(ctx) {
+    function create_fragment$a(ctx) {
     	let div;
-    	let each_value = /*rowData*/ ctx[2];
+    	let each_value = /*rowData*/ ctx[3];
     	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$4(get_each_context$4(ctx, each_value, i));
     	}
 
     	const block = {
@@ -1945,28 +2341,30 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div, "class", "keyboard");
-    			add_location(div, file$1, 78, 0, 2183);
+    			add_location(div, file$a, 78, 0, 2183);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(div, null);
+    				}
     			}
     		},
     		p: function update(ctx, dirty) {
     			if (dirty[0] & /*page, rowData, percentWidth, style, onKey*/ 31) {
-    				each_value = /*rowData*/ ctx[2];
+    				each_value = /*rowData*/ ctx[3];
     				validate_each_argument(each_value);
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$1(ctx, each_value, i);
+    					const child_ctx = get_each_context$4(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     					} else {
-    						each_blocks[i] = create_each_block$1(child_ctx);
+    						each_blocks[i] = create_each_block$4(child_ctx);
     						each_blocks[i].c();
     						each_blocks[i].m(div, null);
     					}
@@ -1989,7 +2387,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$1.name,
+    		id: create_fragment$a.name,
     		type: "component",
     		source: "",
     		ctx
@@ -2000,9 +2398,22 @@ var app = (function () {
 
     const alphabet = "abcdefghijklmnopqrstuvwxyz";
 
-    function instance$1($$self, $$props, $$invalidate) {
+    function instance$a($$self, $$props, $$invalidate) {
+    	let rawData;
+    	let data;
+    	let page0;
+    	let page1;
+    	let rows0;
+    	let rows1;
+    	let rowData0;
+    	let rowData1;
+    	let rowData;
+    	let maxInRow0;
+    	let maxInRow1;
+    	let maxInRow;
+    	let percentWidth;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Keyboard", slots, []);
+    	validate_slots('Keyboard', slots, []);
     	const dispatch = createEventDispatcher();
     	let { custom } = $$props;
     	let { style = "" } = $$props;
@@ -2028,7 +2439,7 @@ var app = (function () {
     		if (value.includes("Page")) {
     			$$invalidate(1, page = +value.substr(-1));
     		} else if (value === "Shift") {
-    			$$invalidate(9, shifted = !shifted);
+    			$$invalidate(7, shifted = !shifted);
     		} else {
     			let output = value;
     			if (shifted && alphabet.includes(value)) output = value.toUpperCase();
@@ -2040,19 +2451,25 @@ var app = (function () {
     		return false;
     	}
 
-    	const writable_props = ["custom", "style", "layout"];
+    	$$self.$$.on_mount.push(function () {
+    		if (custom === undefined && !('custom' in $$props || $$self.$$.bound[$$self.$$.props['custom']])) {
+    			console.warn("<Keyboard> was created without expected prop 'custom'");
+    		}
+    	});
+
+    	const writable_props = ['custom', 'style', 'layout'];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Keyboard> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Keyboard> was created with unknown prop '${key}'`);
     	});
 
     	const touchstart_handler = (value, e) => onKey(value, e);
     	const mousedown_handler = (value, e) => onKey(value, e);
 
     	$$self.$$set = $$props => {
-    		if ("custom" in $$props) $$invalidate(5, custom = $$props.custom);
-    		if ("style" in $$props) $$invalidate(0, style = $$props.style);
-    		if ("layout" in $$props) $$invalidate(6, layout = $$props.layout);
+    		if ('custom' in $$props) $$invalidate(5, custom = $$props.custom);
+    		if ('style' in $$props) $$invalidate(0, style = $$props.style);
+    		if ('layout' in $$props) $$invalidate(6, layout = $$props.layout);
     	};
 
     	$$self.$capture_state = () => ({
@@ -2072,55 +2489,41 @@ var app = (function () {
     		swaps,
     		unique,
     		onKey,
-    		rawData,
-    		data,
-    		page0,
+    		maxInRow,
+    		percentWidth,
+    		maxInRow1,
+    		maxInRow0,
+    		rowData1,
+    		rowData0,
+    		rowData,
     		page1,
     		rows0,
+    		page0,
     		rows1,
-    		rowData0,
-    		rowData1,
-    		rowData,
-    		maxInRow0,
-    		maxInRow1,
-    		maxInRow,
-    		percentWidth
+    		data,
+    		rawData
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("custom" in $$props) $$invalidate(5, custom = $$props.custom);
-    		if ("style" in $$props) $$invalidate(0, style = $$props.style);
-    		if ("layout" in $$props) $$invalidate(6, layout = $$props.layout);
-    		if ("page" in $$props) $$invalidate(1, page = $$props.page);
-    		if ("shifted" in $$props) $$invalidate(9, shifted = $$props.shifted);
-    		if ("rawData" in $$props) $$invalidate(10, rawData = $$props.rawData);
-    		if ("data" in $$props) $$invalidate(11, data = $$props.data);
-    		if ("page0" in $$props) $$invalidate(12, page0 = $$props.page0);
-    		if ("page1" in $$props) $$invalidate(13, page1 = $$props.page1);
-    		if ("rows0" in $$props) $$invalidate(14, rows0 = $$props.rows0);
-    		if ("rows1" in $$props) $$invalidate(15, rows1 = $$props.rows1);
-    		if ("rowData0" in $$props) $$invalidate(16, rowData0 = $$props.rowData0);
-    		if ("rowData1" in $$props) $$invalidate(17, rowData1 = $$props.rowData1);
-    		if ("rowData" in $$props) $$invalidate(2, rowData = $$props.rowData);
-    		if ("maxInRow0" in $$props) $$invalidate(18, maxInRow0 = $$props.maxInRow0);
-    		if ("maxInRow1" in $$props) $$invalidate(19, maxInRow1 = $$props.maxInRow1);
-    		if ("maxInRow" in $$props) $$invalidate(20, maxInRow = $$props.maxInRow);
-    		if ("percentWidth" in $$props) $$invalidate(3, percentWidth = $$props.percentWidth);
+    		if ('custom' in $$props) $$invalidate(5, custom = $$props.custom);
+    		if ('style' in $$props) $$invalidate(0, style = $$props.style);
+    		if ('layout' in $$props) $$invalidate(6, layout = $$props.layout);
+    		if ('page' in $$props) $$invalidate(1, page = $$props.page);
+    		if ('shifted' in $$props) $$invalidate(7, shifted = $$props.shifted);
+    		if ('maxInRow' in $$props) $$invalidate(8, maxInRow = $$props.maxInRow);
+    		if ('percentWidth' in $$props) $$invalidate(2, percentWidth = $$props.percentWidth);
+    		if ('maxInRow1' in $$props) $$invalidate(9, maxInRow1 = $$props.maxInRow1);
+    		if ('maxInRow0' in $$props) $$invalidate(10, maxInRow0 = $$props.maxInRow0);
+    		if ('rowData1' in $$props) $$invalidate(11, rowData1 = $$props.rowData1);
+    		if ('rowData0' in $$props) $$invalidate(12, rowData0 = $$props.rowData0);
+    		if ('rowData' in $$props) $$invalidate(3, rowData = $$props.rowData);
+    		if ('page1' in $$props) $$invalidate(13, page1 = $$props.page1);
+    		if ('rows0' in $$props) $$invalidate(14, rows0 = $$props.rows0);
+    		if ('page0' in $$props) $$invalidate(15, page0 = $$props.page0);
+    		if ('rows1' in $$props) $$invalidate(16, rows1 = $$props.rows1);
+    		if ('data' in $$props) $$invalidate(17, data = $$props.data);
+    		if ('rawData' in $$props) $$invalidate(18, rawData = $$props.rawData);
     	};
-
-    	let rawData;
-    	let data;
-    	let page0;
-    	let page1;
-    	let rows0;
-    	let rows1;
-    	let rowData0;
-    	let rowData1;
-    	let rowData;
-    	let maxInRow0;
-    	let maxInRow1;
-    	let maxInRow;
-    	let percentWidth;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -2128,11 +2531,11 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty[0] & /*custom, layout*/ 96) {
-    			 $$invalidate(10, rawData = custom || layouts[layout]);
+    			$$invalidate(18, rawData = custom || layouts[layout]);
     		}
 
-    		if ($$self.$$.dirty[0] & /*rawData, shifted*/ 1536) {
-    			 $$invalidate(11, data = rawData.map(d => {
+    		if ($$self.$$.dirty[0] & /*rawData, shifted*/ 262272) {
+    			$$invalidate(17, data = rawData.map(d => {
     				let display = d.display;
     				if (swaps[d.value]) display = swaps[d.value];
     				if (!display) display = shifted ? d.value.toUpperCase() : d.value;
@@ -2141,67 +2544,79 @@ var app = (function () {
     			}));
     		}
 
-    		if ($$self.$$.dirty[0] & /*data*/ 2048) {
-    			 $$invalidate(12, page0 = data.filter(d => !d.page));
+    		if ($$self.$$.dirty[0] & /*data*/ 131072) {
+    			$$invalidate(15, page0 = data.filter(d => !d.page));
     		}
 
-    		if ($$self.$$.dirty[0] & /*data*/ 2048) {
-    			 $$invalidate(13, page1 = data.filter(d => d.page));
+    		if ($$self.$$.dirty[0] & /*data*/ 131072) {
+    			$$invalidate(13, page1 = data.filter(d => d.page));
     		}
 
-    		if ($$self.$$.dirty[0] & /*page0*/ 4096) {
-    			 $$invalidate(14, rows0 = unique(page0.map(d => d.row)));
+    		if ($$self.$$.dirty[0] & /*page0*/ 32768) {
+    			$$invalidate(14, rows0 = unique(page0.map(d => d.row)));
     		}
 
     		if ($$self.$$.dirty[0] & /*rows0*/ 16384) {
-    			 (rows0.sort((a, b) => a - b));
+    			(rows0.sort((a, b) => a - b));
     		}
 
     		if ($$self.$$.dirty[0] & /*page1*/ 8192) {
-    			 $$invalidate(15, rows1 = unique(page1.map(d => d.row)));
+    			$$invalidate(16, rows1 = unique(page1.map(d => d.row)));
     		}
 
-    		if ($$self.$$.dirty[0] & /*rows1*/ 32768) {
-    			 (rows1.sort((a, b) => a - b));
+    		if ($$self.$$.dirty[0] & /*rows1*/ 65536) {
+    			(rows1.sort((a, b) => a - b));
     		}
 
-    		if ($$self.$$.dirty[0] & /*rows0, page0*/ 20480) {
-    			 $$invalidate(16, rowData0 = rows0.map(r => page0.filter(k => k.row === r)));
+    		if ($$self.$$.dirty[0] & /*rows0, page0*/ 49152) {
+    			$$invalidate(12, rowData0 = rows0.map(r => page0.filter(k => k.row === r)));
     		}
 
     		if ($$self.$$.dirty[0] & /*rows0, page1*/ 24576) {
-    			 $$invalidate(17, rowData1 = rows0.map(r => page1.filter(k => k.row === r)));
+    			$$invalidate(11, rowData1 = rows0.map(r => page1.filter(k => k.row === r)));
     		}
 
-    		if ($$self.$$.dirty[0] & /*rowData0, rowData1*/ 196608) {
-    			 $$invalidate(2, rowData = [rowData0, rowData1]);
+    		if ($$self.$$.dirty[0] & /*rowData0, rowData1*/ 6144) {
+    			$$invalidate(3, rowData = [rowData0, rowData1]);
     		}
 
-    		if ($$self.$$.dirty[0] & /*rowData0*/ 65536) {
-    			 $$invalidate(18, maxInRow0 = Math.max(...rowData0.map(r => r.length)));
+    		if ($$self.$$.dirty[0] & /*rowData0*/ 4096) {
+    			$$invalidate(10, maxInRow0 = Math.max(...rowData0.map(r => r.length)));
     		}
 
-    		if ($$self.$$.dirty[0] & /*rowData1*/ 131072) {
-    			 $$invalidate(19, maxInRow1 = Math.max(...rowData1.map(r => r.length)));
+    		if ($$self.$$.dirty[0] & /*rowData1*/ 2048) {
+    			$$invalidate(9, maxInRow1 = Math.max(...rowData1.map(r => r.length)));
     		}
 
-    		if ($$self.$$.dirty[0] & /*maxInRow0, maxInRow1*/ 786432) {
-    			 $$invalidate(20, maxInRow = Math.max(maxInRow0, maxInRow1));
+    		if ($$self.$$.dirty[0] & /*maxInRow0, maxInRow1*/ 1536) {
+    			$$invalidate(8, maxInRow = Math.max(maxInRow0, maxInRow1));
     		}
 
-    		if ($$self.$$.dirty[0] & /*maxInRow*/ 1048576) {
-    			 $$invalidate(3, percentWidth = `${1 / maxInRow * 100}%`);
+    		if ($$self.$$.dirty[0] & /*maxInRow*/ 256) {
+    			$$invalidate(2, percentWidth = `${1 / maxInRow * 100}%`);
     		}
     	};
 
     	return [
     		style,
     		page,
-    		rowData,
     		percentWidth,
+    		rowData,
     		onKey,
     		custom,
     		layout,
+    		shifted,
+    		maxInRow,
+    		maxInRow1,
+    		maxInRow0,
+    		rowData1,
+    		rowData0,
+    		page1,
+    		rows0,
+    		page0,
+    		rows1,
+    		data,
+    		rawData,
     		touchstart_handler,
     		mousedown_handler
     	];
@@ -2210,21 +2625,14 @@ var app = (function () {
     class Keyboard extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { custom: 5, style: 0, layout: 6 }, [-1, -1]);
+    		init(this, options, instance$a, create_fragment$a, safe_not_equal, { custom: 5, style: 0, layout: 6 }, null, [-1, -1]);
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Keyboard",
     			options,
-    			id: create_fragment$1.name
+    			id: create_fragment$a.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*custom*/ ctx[5] === undefined && !("custom" in props)) {
-    			console.warn("<Keyboard> was created without expected prop 'custom'");
-    		}
     	}
 
     	get custom() {
@@ -2339,12 +2747,12 @@ var app = (function () {
     		devices.windows();
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Cell.svelte generated by Svelte v3.29.0 */
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Cell.svelte generated by Svelte v3.59.2 */
 
-    const file$2 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Cell.svelte";
+    const file$9 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Cell.svelte";
 
     // (108:2) {#if showCheck && !correct}
-    function create_if_block_1$1(ctx) {
+    function create_if_block_1$2(ctx) {
     	let line;
 
     	const block = {
@@ -2353,18 +2761,13 @@ var app = (function () {
     			this.h();
     		},
     		l: function claim(nodes) {
-    			line = claim_element(
-    				nodes,
-    				"line",
-    				{
-    					x1: true,
-    					y1: true,
-    					x2: true,
-    					y2: true,
-    					class: true
-    				},
-    				1
-    			);
+    			line = claim_svg_element(nodes, "line", {
+    				x1: true,
+    				y1: true,
+    				x2: true,
+    				y2: true,
+    				class: true
+    			});
 
     			children(line).forEach(detach_dev);
     			this.h();
@@ -2375,10 +2778,10 @@ var app = (function () {
     			attr_dev(line, "x2", "1");
     			attr_dev(line, "y2", "0");
     			attr_dev(line, "class", "svelte-1veput");
-    			add_location(line, file$2, 108, 4, 2459);
+    			add_location(line, file$9, 108, 4, 2459);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, line, anchor);
+    			insert_hydration_dev(target, line, anchor);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(line);
@@ -2387,7 +2790,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_1$1.name,
+    		id: create_if_block_1$2.name,
     		type: "if",
     		source: "(108:2) {#if showCheck && !correct}",
     		ctx
@@ -2397,7 +2800,7 @@ var app = (function () {
     }
 
     // (112:2) {#if value}
-    function create_if_block$2(ctx) {
+    function create_if_block$3(ctx) {
     	let text_1;
     	let t;
     	let text_1_transition;
@@ -2410,17 +2813,12 @@ var app = (function () {
     			this.h();
     		},
     		l: function claim(nodes) {
-    			text_1 = claim_element(
-    				nodes,
-    				"text",
-    				{
-    					class: true,
-    					x: true,
-    					y: true,
-    					"text-anchor": true
-    				},
-    				1
-    			);
+    			text_1 = claim_svg_element(nodes, "text", {
+    				class: true,
+    				x: true,
+    				y: true,
+    				"text-anchor": true
+    			});
 
     			var text_1_nodes = children(text_1);
     			t = claim_text(text_1_nodes, /*value*/ ctx[2]);
@@ -2432,11 +2830,11 @@ var app = (function () {
     			attr_dev(text_1, "x", "0.5");
     			attr_dev(text_1, "y", "0.9");
     			attr_dev(text_1, "text-anchor", "middle");
-    			add_location(text_1, file$2, 112, 4, 2528);
+    			add_location(text_1, file$9, 112, 4, 2528);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, text_1, anchor);
-    			append_dev(text_1, t);
+    			insert_hydration_dev(target, text_1, anchor);
+    			append_hydration_dev(text_1, t);
     			current = true;
     		},
     		p: function update(new_ctx, dirty) {
@@ -2447,6 +2845,8 @@ var app = (function () {
     			if (current) return;
 
     			add_render_callback(() => {
+    				if (!current) return;
+
     				if (!text_1_transition) text_1_transition = create_bidirectional_transition(
     					text_1,
     					pop,
@@ -2486,7 +2886,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block$2.name,
+    		id: create_if_block$3.name,
     		type: "if",
     		source: "(112:2) {#if value}",
     		ctx
@@ -2495,7 +2895,7 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$2(ctx) {
+    function create_fragment$9(ctx) {
     	let g;
     	let rect;
     	let if_block0_anchor;
@@ -2506,8 +2906,8 @@ var app = (function () {
     	let current;
     	let mounted;
     	let dispose;
-    	let if_block0 = /*showCheck*/ ctx[11] && !/*correct*/ ctx[10] && create_if_block_1$1(ctx);
-    	let if_block1 = /*value*/ ctx[2] && create_if_block$2(ctx);
+    	let if_block0 = /*showCheck*/ ctx[10] && !/*correct*/ ctx[11] && create_if_block_1$2(ctx);
+    	let if_block1 = /*value*/ ctx[2] && create_if_block$3(ctx);
 
     	const block = {
     		c: function create() {
@@ -2521,35 +2921,25 @@ var app = (function () {
     			this.h();
     		},
     		l: function claim(nodes) {
-    			g = claim_element(
-    				nodes,
-    				"g",
-    				{
-    					class: true,
-    					transform: true,
-    					tabIndex: true
-    				},
-    				1
-    			);
+    			g = claim_svg_element(nodes, "g", {
+    				class: true,
+    				transform: true,
+    				tabindex: true
+    			});
 
     			var g_nodes = children(g);
-    			rect = claim_element(g_nodes, "rect", { width: true, height: true, class: true }, 1);
+    			rect = claim_svg_element(g_nodes, "rect", { width: true, height: true, class: true });
     			children(rect).forEach(detach_dev);
     			if (if_block0) if_block0.l(g_nodes);
     			if_block0_anchor = empty();
     			if (if_block1) if_block1.l(g_nodes);
 
-    			text_1 = claim_element(
-    				g_nodes,
-    				"text",
-    				{
-    					class: true,
-    					x: true,
-    					y: true,
-    					"text-anchor": true
-    				},
-    				1
-    			);
+    			text_1 = claim_svg_element(g_nodes, "text", {
+    				class: true,
+    				x: true,
+    				y: true,
+    				"text-anchor": true
+    			});
 
     			var text_1_nodes = children(text_1);
     			t = claim_text(text_1_nodes, /*number*/ ctx[3]);
@@ -2561,45 +2951,45 @@ var app = (function () {
     			attr_dev(rect, "width", "1");
     			attr_dev(rect, "height", "1");
     			attr_dev(rect, "class", "svelte-1veput");
-    			add_location(rect, file$2, 105, 2, 2389);
+    			add_location(rect, file$9, 105, 2, 2389);
     			attr_dev(text_1, "class", "number svelte-1veput");
     			attr_dev(text_1, "x", "0.08");
     			attr_dev(text_1, "y", "0.3");
     			attr_dev(text_1, "text-anchor", "start");
-    			add_location(text_1, file$2, 121, 2, 2733);
+    			add_location(text_1, file$9, 121, 2, 2733);
     			attr_dev(g, "class", g_class_value = "cell " + /*custom*/ ctx[4] + " cell-" + /*x*/ ctx[0] + "-" + /*y*/ ctx[1] + " svelte-1veput");
     			attr_dev(g, "transform", g_transform_value = `translate(${/*x*/ ctx[0]}, ${/*y*/ ctx[1]})`);
     			attr_dev(g, "tabindex", "0");
     			toggle_class(g, "is-focused", /*isFocused*/ ctx[7]);
     			toggle_class(g, "is-secondarily-focused", /*isSecondarilyFocused*/ ctx[8]);
-    			toggle_class(g, "is-correct", /*showCheck*/ ctx[11] && /*correct*/ ctx[10]);
-    			toggle_class(g, "is-incorrect", /*showCheck*/ ctx[11] && !/*correct*/ ctx[10]);
-    			add_location(g, file$2, 94, 0, 2037);
+    			toggle_class(g, "is-correct", /*showCheck*/ ctx[10] && /*correct*/ ctx[11]);
+    			toggle_class(g, "is-incorrect", /*showCheck*/ ctx[10] && !/*correct*/ ctx[11]);
+    			add_location(g, file$9, 94, 0, 2037);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, g, anchor);
-    			append_dev(g, rect);
+    			insert_hydration_dev(target, g, anchor);
+    			append_hydration_dev(g, rect);
     			if (if_block0) if_block0.m(g, null);
-    			append_dev(g, if_block0_anchor);
+    			append_hydration_dev(g, if_block0_anchor);
     			if (if_block1) if_block1.m(g, null);
-    			append_dev(g, text_1);
-    			append_dev(text_1, t);
+    			append_hydration_dev(g, text_1);
+    			append_hydration_dev(text_1, t);
     			/*g_binding*/ ctx[23](g);
     			current = true;
 
     			if (!mounted) {
     				dispose = [
-    					listen_dev(g, "click", /*onClick*/ ctx[13], false, false, false),
-    					listen_dev(g, "keydown", /*onKeydown*/ ctx[12], false, false, false)
+    					listen_dev(g, "click", /*onClick*/ ctx[13], false, false, false, false),
+    					listen_dev(g, "keydown", /*onKeydown*/ ctx[12], false, false, false, false)
     				];
 
     				mounted = true;
     			}
     		},
     		p: function update(ctx, [dirty]) {
-    			if (/*showCheck*/ ctx[11] && !/*correct*/ ctx[10]) {
+    			if (/*showCheck*/ ctx[10] && !/*correct*/ ctx[11]) {
     				if (if_block0) ; else {
-    					if_block0 = create_if_block_1$1(ctx);
+    					if_block0 = create_if_block_1$2(ctx);
     					if_block0.c();
     					if_block0.m(g, if_block0_anchor);
     				}
@@ -2616,7 +3006,7 @@ var app = (function () {
     						transition_in(if_block1, 1);
     					}
     				} else {
-    					if_block1 = create_if_block$2(ctx);
+    					if_block1 = create_if_block$3(ctx);
     					if_block1.c();
     					transition_in(if_block1, 1);
     					if_block1.m(g, text_1);
@@ -2641,20 +3031,20 @@ var app = (function () {
     				attr_dev(g, "transform", g_transform_value);
     			}
 
-    			if (dirty & /*custom, x, y, isFocused*/ 147) {
+    			if (!current || dirty & /*custom, x, y, isFocused*/ 147) {
     				toggle_class(g, "is-focused", /*isFocused*/ ctx[7]);
     			}
 
-    			if (dirty & /*custom, x, y, isSecondarilyFocused*/ 275) {
+    			if (!current || dirty & /*custom, x, y, isSecondarilyFocused*/ 275) {
     				toggle_class(g, "is-secondarily-focused", /*isSecondarilyFocused*/ ctx[8]);
     			}
 
-    			if (dirty & /*custom, x, y, showCheck, correct*/ 3091) {
-    				toggle_class(g, "is-correct", /*showCheck*/ ctx[11] && /*correct*/ ctx[10]);
+    			if (!current || dirty & /*custom, x, y, showCheck, correct*/ 3091) {
+    				toggle_class(g, "is-correct", /*showCheck*/ ctx[10] && /*correct*/ ctx[11]);
     			}
 
-    			if (dirty & /*custom, x, y, showCheck, correct*/ 3091) {
-    				toggle_class(g, "is-incorrect", /*showCheck*/ ctx[11] && !/*correct*/ ctx[10]);
+    			if (!current || dirty & /*custom, x, y, showCheck, correct*/ 3091) {
+    				toggle_class(g, "is-incorrect", /*showCheck*/ ctx[10] && !/*correct*/ ctx[11]);
     			}
     		},
     		i: function intro(local) {
@@ -2678,7 +3068,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$2.name,
+    		id: create_fragment$9.name,
     		type: "component",
     		source: "",
     		ctx
@@ -2696,9 +3086,11 @@ var app = (function () {
     	};
     }
 
-    function instance$2($$self, $$props, $$invalidate) {
+    function instance$9($$self, $$props, $$invalidate) {
+    	let correct;
+    	let showCheck;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Cell", slots, []);
+    	validate_slots('Cell', slots, []);
     	let { x } = $$props;
     	let { y } = $$props;
     	let { value } = $$props;
@@ -2796,57 +3188,87 @@ var app = (function () {
     		onFocusCell(index);
     	}
 
+    	$$self.$$.on_mount.push(function () {
+    		if (x === undefined && !('x' in $$props || $$self.$$.bound[$$self.$$.props['x']])) {
+    			console.warn("<Cell> was created without expected prop 'x'");
+    		}
+
+    		if (y === undefined && !('y' in $$props || $$self.$$.bound[$$self.$$.props['y']])) {
+    			console.warn("<Cell> was created without expected prop 'y'");
+    		}
+
+    		if (value === undefined && !('value' in $$props || $$self.$$.bound[$$self.$$.props['value']])) {
+    			console.warn("<Cell> was created without expected prop 'value'");
+    		}
+
+    		if (answer === undefined && !('answer' in $$props || $$self.$$.bound[$$self.$$.props['answer']])) {
+    			console.warn("<Cell> was created without expected prop 'answer'");
+    		}
+
+    		if (number === undefined && !('number' in $$props || $$self.$$.bound[$$self.$$.props['number']])) {
+    			console.warn("<Cell> was created without expected prop 'number'");
+    		}
+
+    		if (index === undefined && !('index' in $$props || $$self.$$.bound[$$self.$$.props['index']])) {
+    			console.warn("<Cell> was created without expected prop 'index'");
+    		}
+
+    		if (custom === undefined && !('custom' in $$props || $$self.$$.bound[$$self.$$.props['custom']])) {
+    			console.warn("<Cell> was created without expected prop 'custom'");
+    		}
+    	});
+
     	const writable_props = [
-    		"x",
-    		"y",
-    		"value",
-    		"answer",
-    		"number",
-    		"index",
-    		"custom",
-    		"changeDelay",
-    		"isRevealing",
-    		"isChecking",
-    		"isFocused",
-    		"isSecondarilyFocused",
-    		"onFocusCell",
-    		"onCellUpdate",
-    		"onFocusClueDiff",
-    		"onMoveFocus",
-    		"onFlipDirection",
-    		"onHistoricalChange"
+    		'x',
+    		'y',
+    		'value',
+    		'answer',
+    		'number',
+    		'index',
+    		'custom',
+    		'changeDelay',
+    		'isRevealing',
+    		'isChecking',
+    		'isFocused',
+    		'isSecondarilyFocused',
+    		'onFocusCell',
+    		'onCellUpdate',
+    		'onFocusClueDiff',
+    		'onMoveFocus',
+    		'onFlipDirection',
+    		'onHistoricalChange'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Cell> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Cell> was created with unknown prop '${key}'`);
     	});
 
     	function g_binding($$value) {
-    		binding_callbacks[$$value ? "unshift" : "push"](() => {
+    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
     			element = $$value;
     			$$invalidate(9, element);
     		});
     	}
 
     	$$self.$$set = $$props => {
-    		if ("x" in $$props) $$invalidate(0, x = $$props.x);
-    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
-    		if ("value" in $$props) $$invalidate(2, value = $$props.value);
-    		if ("answer" in $$props) $$invalidate(14, answer = $$props.answer);
-    		if ("number" in $$props) $$invalidate(3, number = $$props.number);
-    		if ("index" in $$props) $$invalidate(15, index = $$props.index);
-    		if ("custom" in $$props) $$invalidate(4, custom = $$props.custom);
-    		if ("changeDelay" in $$props) $$invalidate(5, changeDelay = $$props.changeDelay);
-    		if ("isRevealing" in $$props) $$invalidate(6, isRevealing = $$props.isRevealing);
-    		if ("isChecking" in $$props) $$invalidate(16, isChecking = $$props.isChecking);
-    		if ("isFocused" in $$props) $$invalidate(7, isFocused = $$props.isFocused);
-    		if ("isSecondarilyFocused" in $$props) $$invalidate(8, isSecondarilyFocused = $$props.isSecondarilyFocused);
-    		if ("onFocusCell" in $$props) $$invalidate(17, onFocusCell = $$props.onFocusCell);
-    		if ("onCellUpdate" in $$props) $$invalidate(18, onCellUpdate = $$props.onCellUpdate);
-    		if ("onFocusClueDiff" in $$props) $$invalidate(19, onFocusClueDiff = $$props.onFocusClueDiff);
-    		if ("onMoveFocus" in $$props) $$invalidate(20, onMoveFocus = $$props.onMoveFocus);
-    		if ("onFlipDirection" in $$props) $$invalidate(21, onFlipDirection = $$props.onFlipDirection);
-    		if ("onHistoricalChange" in $$props) $$invalidate(22, onHistoricalChange = $$props.onHistoricalChange);
+    		if ('x' in $$props) $$invalidate(0, x = $$props.x);
+    		if ('y' in $$props) $$invalidate(1, y = $$props.y);
+    		if ('value' in $$props) $$invalidate(2, value = $$props.value);
+    		if ('answer' in $$props) $$invalidate(14, answer = $$props.answer);
+    		if ('number' in $$props) $$invalidate(3, number = $$props.number);
+    		if ('index' in $$props) $$invalidate(15, index = $$props.index);
+    		if ('custom' in $$props) $$invalidate(4, custom = $$props.custom);
+    		if ('changeDelay' in $$props) $$invalidate(5, changeDelay = $$props.changeDelay);
+    		if ('isRevealing' in $$props) $$invalidate(6, isRevealing = $$props.isRevealing);
+    		if ('isChecking' in $$props) $$invalidate(16, isChecking = $$props.isChecking);
+    		if ('isFocused' in $$props) $$invalidate(7, isFocused = $$props.isFocused);
+    		if ('isSecondarilyFocused' in $$props) $$invalidate(8, isSecondarilyFocused = $$props.isSecondarilyFocused);
+    		if ('onFocusCell' in $$props) $$invalidate(17, onFocusCell = $$props.onFocusCell);
+    		if ('onCellUpdate' in $$props) $$invalidate(18, onCellUpdate = $$props.onCellUpdate);
+    		if ('onFocusClueDiff' in $$props) $$invalidate(19, onFocusClueDiff = $$props.onFocusClueDiff);
+    		if ('onMoveFocus' in $$props) $$invalidate(20, onMoveFocus = $$props.onMoveFocus);
+    		if ('onFlipDirection' in $$props) $$invalidate(21, onFlipDirection = $$props.onFlipDirection);
+    		if ('onHistoricalChange' in $$props) $$invalidate(22, onHistoricalChange = $$props.onHistoricalChange);
     	};
 
     	$$self.$capture_state = () => ({
@@ -2873,36 +3295,33 @@ var app = (function () {
     		onKeydown,
     		onClick,
     		pop,
-    		correct,
-    		showCheck
+    		showCheck,
+    		correct
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("x" in $$props) $$invalidate(0, x = $$props.x);
-    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
-    		if ("value" in $$props) $$invalidate(2, value = $$props.value);
-    		if ("answer" in $$props) $$invalidate(14, answer = $$props.answer);
-    		if ("number" in $$props) $$invalidate(3, number = $$props.number);
-    		if ("index" in $$props) $$invalidate(15, index = $$props.index);
-    		if ("custom" in $$props) $$invalidate(4, custom = $$props.custom);
-    		if ("changeDelay" in $$props) $$invalidate(5, changeDelay = $$props.changeDelay);
-    		if ("isRevealing" in $$props) $$invalidate(6, isRevealing = $$props.isRevealing);
-    		if ("isChecking" in $$props) $$invalidate(16, isChecking = $$props.isChecking);
-    		if ("isFocused" in $$props) $$invalidate(7, isFocused = $$props.isFocused);
-    		if ("isSecondarilyFocused" in $$props) $$invalidate(8, isSecondarilyFocused = $$props.isSecondarilyFocused);
-    		if ("onFocusCell" in $$props) $$invalidate(17, onFocusCell = $$props.onFocusCell);
-    		if ("onCellUpdate" in $$props) $$invalidate(18, onCellUpdate = $$props.onCellUpdate);
-    		if ("onFocusClueDiff" in $$props) $$invalidate(19, onFocusClueDiff = $$props.onFocusClueDiff);
-    		if ("onMoveFocus" in $$props) $$invalidate(20, onMoveFocus = $$props.onMoveFocus);
-    		if ("onFlipDirection" in $$props) $$invalidate(21, onFlipDirection = $$props.onFlipDirection);
-    		if ("onHistoricalChange" in $$props) $$invalidate(22, onHistoricalChange = $$props.onHistoricalChange);
-    		if ("element" in $$props) $$invalidate(9, element = $$props.element);
-    		if ("correct" in $$props) $$invalidate(10, correct = $$props.correct);
-    		if ("showCheck" in $$props) $$invalidate(11, showCheck = $$props.showCheck);
+    		if ('x' in $$props) $$invalidate(0, x = $$props.x);
+    		if ('y' in $$props) $$invalidate(1, y = $$props.y);
+    		if ('value' in $$props) $$invalidate(2, value = $$props.value);
+    		if ('answer' in $$props) $$invalidate(14, answer = $$props.answer);
+    		if ('number' in $$props) $$invalidate(3, number = $$props.number);
+    		if ('index' in $$props) $$invalidate(15, index = $$props.index);
+    		if ('custom' in $$props) $$invalidate(4, custom = $$props.custom);
+    		if ('changeDelay' in $$props) $$invalidate(5, changeDelay = $$props.changeDelay);
+    		if ('isRevealing' in $$props) $$invalidate(6, isRevealing = $$props.isRevealing);
+    		if ('isChecking' in $$props) $$invalidate(16, isChecking = $$props.isChecking);
+    		if ('isFocused' in $$props) $$invalidate(7, isFocused = $$props.isFocused);
+    		if ('isSecondarilyFocused' in $$props) $$invalidate(8, isSecondarilyFocused = $$props.isSecondarilyFocused);
+    		if ('onFocusCell' in $$props) $$invalidate(17, onFocusCell = $$props.onFocusCell);
+    		if ('onCellUpdate' in $$props) $$invalidate(18, onCellUpdate = $$props.onCellUpdate);
+    		if ('onFocusClueDiff' in $$props) $$invalidate(19, onFocusClueDiff = $$props.onFocusClueDiff);
+    		if ('onMoveFocus' in $$props) $$invalidate(20, onMoveFocus = $$props.onMoveFocus);
+    		if ('onFlipDirection' in $$props) $$invalidate(21, onFlipDirection = $$props.onFlipDirection);
+    		if ('onHistoricalChange' in $$props) $$invalidate(22, onHistoricalChange = $$props.onHistoricalChange);
+    		if ('element' in $$props) $$invalidate(9, element = $$props.element);
+    		if ('showCheck' in $$props) $$invalidate(10, showCheck = $$props.showCheck);
+    		if ('correct' in $$props) $$invalidate(11, correct = $$props.correct);
     	};
-
-    	let correct;
-    	let showCheck;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -2910,15 +3329,15 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty & /*isFocused*/ 128) {
-    			 (onFocusSelf());
+    			(onFocusSelf());
     		}
 
     		if ($$self.$$.dirty & /*answer, value*/ 16388) {
-    			 $$invalidate(10, correct = answer === value);
+    			$$invalidate(11, correct = answer === value);
     		}
 
     		if ($$self.$$.dirty & /*isChecking, value*/ 65540) {
-    			 $$invalidate(11, showCheck = isChecking && value);
+    			$$invalidate(10, showCheck = isChecking && value);
     		}
     	};
 
@@ -2933,8 +3352,8 @@ var app = (function () {
     		isFocused,
     		isSecondarilyFocused,
     		element,
-    		correct,
     		showCheck,
+    		correct,
     		onKeydown,
     		onClick,
     		answer,
@@ -2954,7 +3373,7 @@ var app = (function () {
     	constructor(options) {
     		super(options);
 
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, {
+    		init(this, options, instance$9, create_fragment$9, safe_not_equal, {
     			x: 0,
     			y: 1,
     			value: 2,
@@ -2979,39 +3398,8 @@ var app = (function () {
     			component: this,
     			tagName: "Cell",
     			options,
-    			id: create_fragment$2.name
+    			id: create_fragment$9.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*x*/ ctx[0] === undefined && !("x" in props)) {
-    			console.warn("<Cell> was created without expected prop 'x'");
-    		}
-
-    		if (/*y*/ ctx[1] === undefined && !("y" in props)) {
-    			console.warn("<Cell> was created without expected prop 'y'");
-    		}
-
-    		if (/*value*/ ctx[2] === undefined && !("value" in props)) {
-    			console.warn("<Cell> was created without expected prop 'value'");
-    		}
-
-    		if (/*answer*/ ctx[14] === undefined && !("answer" in props)) {
-    			console.warn("<Cell> was created without expected prop 'answer'");
-    		}
-
-    		if (/*number*/ ctx[3] === undefined && !("number" in props)) {
-    			console.warn("<Cell> was created without expected prop 'number'");
-    		}
-
-    		if (/*index*/ ctx[15] === undefined && !("index" in props)) {
-    			console.warn("<Cell> was created without expected prop 'index'");
-    		}
-
-    		if (/*custom*/ ctx[4] === undefined && !("custom" in props)) {
-    			console.warn("<Cell> was created without expected prop 'custom'");
-    		}
     	}
 
     	get x() {
@@ -3159,10 +3547,10 @@ var app = (function () {
     	}
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Puzzle.svelte generated by Svelte v3.29.0 */
-    const file$3 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Puzzle.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Puzzle.svelte generated by Svelte v3.59.2 */
+    const file$8 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Puzzle.svelte";
 
-    function get_each_context$2(ctx, list, i) {
+    function get_each_context$3(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[36] = list[i].x;
     	child_ctx[37] = list[i].y;
@@ -3175,7 +3563,7 @@ var app = (function () {
     }
 
     // (200:4) {#each cells as { x, y, value, answer, index, number, custom }}
-    function create_each_block$2(ctx) {
+    function create_each_block$3(ctx) {
     	let cell;
     	let current;
 
@@ -3252,7 +3640,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block$2.name,
+    		id: create_each_block$3.name,
     		type: "each",
     		source: "(200:4) {#each cells as { x, y, value, answer, index, number, custom }}",
     		ctx
@@ -3262,7 +3650,7 @@ var app = (function () {
     }
 
     // (224:0) {#if keyboardVisible}
-    function create_if_block$3(ctx) {
+    function create_if_block$2(ctx) {
     	let div;
     	let keyboard;
     	let current;
@@ -3292,10 +3680,10 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div, "class", "keyboard svelte-ce6hth");
-    			add_location(div, file$3, 224, 2, 6863);
+    			add_location(div, file$8, 224, 2, 6863);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
     			mount_component(keyboard, div, null);
     			current = true;
     		},
@@ -3321,7 +3709,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block$3.name,
+    		id: create_if_block$2.name,
     		type: "if",
     		source: "(224:0) {#if keyboardVisible}",
     		ctx
@@ -3330,7 +3718,7 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$3(ctx) {
+    function create_fragment$8(ctx) {
     	let section;
     	let svg;
     	let svg_viewBox_value;
@@ -3344,14 +3732,14 @@ var app = (function () {
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$2(get_each_context$2(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$3(get_each_context$3(ctx, each_value, i));
     	}
 
     	const out = i => transition_out(each_blocks[i], 1, 1, () => {
     		each_blocks[i] = null;
     	});
 
-    	let if_block = /*keyboardVisible*/ ctx[13] && create_if_block$3(ctx);
+    	let if_block = /*keyboardVisible*/ ctx[11] && create_if_block$2(ctx);
 
     	const block = {
     		c: function create() {
@@ -3370,7 +3758,7 @@ var app = (function () {
     		l: function claim(nodes) {
     			section = claim_element(nodes, "SECTION", { class: true });
     			var section_nodes = children(section);
-    			svg = claim_element(section_nodes, "svg", { viewBox: true, class: true }, 1);
+    			svg = claim_svg_element(section_nodes, "svg", { viewBox: true, class: true });
     			var svg_nodes = children(svg);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
@@ -3385,30 +3773,32 @@ var app = (function () {
     			this.h();
     		},
     		h: function hydrate() {
-    			attr_dev(svg, "viewBox", svg_viewBox_value = "0 0 " + /*w*/ ctx[11] + " " + /*h*/ ctx[12]);
+    			attr_dev(svg, "viewBox", svg_viewBox_value = "0 0 " + /*w*/ ctx[13] + " " + /*h*/ ctx[12]);
     			attr_dev(svg, "class", "svelte-ce6hth");
-    			add_location(svg, file$3, 198, 2, 5970);
+    			add_location(svg, file$8, 198, 2, 5970);
     			attr_dev(section, "class", "puzzle svelte-ce6hth");
     			toggle_class(section, "stacked", /*stacked*/ ctx[5]);
     			toggle_class(section, "is-loaded", /*isLoaded*/ ctx[7]);
-    			add_location(section, file$3, 193, 0, 5870);
+    			add_location(section, file$8, 193, 0, 5870);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, section, anchor);
-    			append_dev(section, svg);
+    			insert_hydration_dev(target, section, anchor);
+    			append_hydration_dev(section, svg);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(svg, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(svg, null);
+    				}
     			}
 
-    			/*section_binding*/ ctx[26](section);
-    			insert_dev(target, t, anchor);
+    			/*section_binding*/ ctx[27](section);
+    			insert_hydration_dev(target, t, anchor);
     			if (if_block) if_block.m(target, anchor);
-    			insert_dev(target, if_block_anchor, anchor);
+    			insert_hydration_dev(target, if_block_anchor, anchor);
     			current = true;
 
     			if (!mounted) {
-    				dispose = listen_dev(window, "click", /*onClick*/ ctx[21], false, false, false);
+    				dispose = listen_dev(window, "click", /*onClick*/ ctx[21], false, false, false, false);
     				mounted = true;
     			}
     		},
@@ -3419,13 +3809,13 @@ var app = (function () {
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$2(ctx, each_value, i);
+    					const child_ctx = get_each_context$3(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     						transition_in(each_blocks[i], 1);
     					} else {
-    						each_blocks[i] = create_each_block$2(child_ctx);
+    						each_blocks[i] = create_each_block$3(child_ctx);
     						each_blocks[i].c();
     						transition_in(each_blocks[i], 1);
     						each_blocks[i].m(svg, null);
@@ -3441,27 +3831,27 @@ var app = (function () {
     				check_outros();
     			}
 
-    			if (!current || dirty[0] & /*w, h*/ 6144 && svg_viewBox_value !== (svg_viewBox_value = "0 0 " + /*w*/ ctx[11] + " " + /*h*/ ctx[12])) {
+    			if (!current || dirty[0] & /*w, h*/ 12288 && svg_viewBox_value !== (svg_viewBox_value = "0 0 " + /*w*/ ctx[13] + " " + /*h*/ ctx[12])) {
     				attr_dev(svg, "viewBox", svg_viewBox_value);
     			}
 
-    			if (dirty[0] & /*stacked*/ 32) {
+    			if (!current || dirty[0] & /*stacked*/ 32) {
     				toggle_class(section, "stacked", /*stacked*/ ctx[5]);
     			}
 
-    			if (dirty[0] & /*isLoaded*/ 128) {
+    			if (!current || dirty[0] & /*isLoaded*/ 128) {
     				toggle_class(section, "is-loaded", /*isLoaded*/ ctx[7]);
     			}
 
-    			if (/*keyboardVisible*/ ctx[13]) {
+    			if (/*keyboardVisible*/ ctx[11]) {
     				if (if_block) {
     					if_block.p(ctx, dirty);
 
-    					if (dirty[0] & /*keyboardVisible*/ 8192) {
+    					if (dirty[0] & /*keyboardVisible*/ 2048) {
     						transition_in(if_block, 1);
     					}
     				} else {
-    					if_block = create_if_block$3(ctx);
+    					if_block = create_if_block$2(ctx);
     					if_block.c();
     					transition_in(if_block, 1);
     					if_block.m(if_block_anchor.parentNode, if_block_anchor);
@@ -3499,7 +3889,7 @@ var app = (function () {
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(section);
     			destroy_each(each_blocks, detaching);
-    			/*section_binding*/ ctx[26](null);
+    			/*section_binding*/ ctx[27](null);
     			if (detaching) detach_dev(t);
     			if (if_block) if_block.d(detaching);
     			if (detaching) detach_dev(if_block_anchor);
@@ -3510,7 +3900,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$3.name,
+    		id: create_fragment$8.name,
     		type: "component",
     		source: "",
     		ctx
@@ -3521,9 +3911,13 @@ var app = (function () {
 
     const numberOfStatesInHistory = 10;
 
-    function instance$3($$self, $$props, $$invalidate) {
+    function instance$8($$self, $$props, $$invalidate) {
+    	let w;
+    	let h;
+    	let keyboardVisible;
+    	let sortedCellsInDirection;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Puzzle", slots, []);
+    	validate_slots('Puzzle', slots, []);
     	let { clues } = $$props;
     	let { cells } = $$props;
     	let { focusedDirection } = $$props;
@@ -3547,7 +3941,7 @@ var app = (function () {
     	let isPuzzleFocused = false;
 
     	onMount(() => {
-    		$$invalidate(31, isMobile = checkMobile());
+    		$$invalidate(26, isMobile = checkMobile());
     	});
 
     	function updateSecondarilyFocusedCells() {
@@ -3659,47 +4053,97 @@ var app = (function () {
     		isPuzzleFocused = element.contains(document.activeElement);
     	}
 
+    	$$self.$$.on_mount.push(function () {
+    		if (clues === undefined && !('clues' in $$props || $$self.$$.bound[$$self.$$.props['clues']])) {
+    			console.warn("<Puzzle> was created without expected prop 'clues'");
+    		}
+
+    		if (cells === undefined && !('cells' in $$props || $$self.$$.bound[$$self.$$.props['cells']])) {
+    			console.warn("<Puzzle> was created without expected prop 'cells'");
+    		}
+
+    		if (focusedDirection === undefined && !('focusedDirection' in $$props || $$self.$$.bound[$$self.$$.props['focusedDirection']])) {
+    			console.warn("<Puzzle> was created without expected prop 'focusedDirection'");
+    		}
+
+    		if (focusedCellIndex === undefined && !('focusedCellIndex' in $$props || $$self.$$.bound[$$self.$$.props['focusedCellIndex']])) {
+    			console.warn("<Puzzle> was created without expected prop 'focusedCellIndex'");
+    		}
+
+    		if (focusedCell === undefined && !('focusedCell' in $$props || $$self.$$.bound[$$self.$$.props['focusedCell']])) {
+    			console.warn("<Puzzle> was created without expected prop 'focusedCell'");
+    		}
+
+    		if (isRevealing === undefined && !('isRevealing' in $$props || $$self.$$.bound[$$self.$$.props['isRevealing']])) {
+    			console.warn("<Puzzle> was created without expected prop 'isRevealing'");
+    		}
+
+    		if (isChecking === undefined && !('isChecking' in $$props || $$self.$$.bound[$$self.$$.props['isChecking']])) {
+    			console.warn("<Puzzle> was created without expected prop 'isChecking'");
+    		}
+
+    		if (isDisableHighlight === undefined && !('isDisableHighlight' in $$props || $$self.$$.bound[$$self.$$.props['isDisableHighlight']])) {
+    			console.warn("<Puzzle> was created without expected prop 'isDisableHighlight'");
+    		}
+
+    		if (stacked === undefined && !('stacked' in $$props || $$self.$$.bound[$$self.$$.props['stacked']])) {
+    			console.warn("<Puzzle> was created without expected prop 'stacked'");
+    		}
+
+    		if (showKeyboard === undefined && !('showKeyboard' in $$props || $$self.$$.bound[$$self.$$.props['showKeyboard']])) {
+    			console.warn("<Puzzle> was created without expected prop 'showKeyboard'");
+    		}
+
+    		if (isLoaded === undefined && !('isLoaded' in $$props || $$self.$$.bound[$$self.$$.props['isLoaded']])) {
+    			console.warn("<Puzzle> was created without expected prop 'isLoaded'");
+    		}
+
+    		if (keyboardStyle === undefined && !('keyboardStyle' in $$props || $$self.$$.bound[$$self.$$.props['keyboardStyle']])) {
+    			console.warn("<Puzzle> was created without expected prop 'keyboardStyle'");
+    		}
+    	});
+
     	const writable_props = [
-    		"clues",
-    		"cells",
-    		"focusedDirection",
-    		"focusedCellIndex",
-    		"focusedCell",
-    		"isRevealing",
-    		"isChecking",
-    		"isDisableHighlight",
-    		"stacked",
-    		"revealDuration",
-    		"showKeyboard",
-    		"isLoaded",
-    		"keyboardStyle"
+    		'clues',
+    		'cells',
+    		'focusedDirection',
+    		'focusedCellIndex',
+    		'focusedCell',
+    		'isRevealing',
+    		'isChecking',
+    		'isDisableHighlight',
+    		'stacked',
+    		'revealDuration',
+    		'showKeyboard',
+    		'isLoaded',
+    		'keyboardStyle'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Puzzle> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Puzzle> was created with unknown prop '${key}'`);
     	});
 
     	function section_binding($$value) {
-    		binding_callbacks[$$value ? "unshift" : "push"](() => {
+    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
     			element = $$value;
     			$$invalidate(9, element);
     		});
     	}
 
     	$$self.$$set = $$props => {
-    		if ("clues" in $$props) $$invalidate(23, clues = $$props.clues);
-    		if ("cells" in $$props) $$invalidate(0, cells = $$props.cells);
-    		if ("focusedDirection" in $$props) $$invalidate(22, focusedDirection = $$props.focusedDirection);
-    		if ("focusedCellIndex" in $$props) $$invalidate(1, focusedCellIndex = $$props.focusedCellIndex);
-    		if ("focusedCell" in $$props) $$invalidate(24, focusedCell = $$props.focusedCell);
-    		if ("isRevealing" in $$props) $$invalidate(2, isRevealing = $$props.isRevealing);
-    		if ("isChecking" in $$props) $$invalidate(3, isChecking = $$props.isChecking);
-    		if ("isDisableHighlight" in $$props) $$invalidate(4, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("stacked" in $$props) $$invalidate(5, stacked = $$props.stacked);
-    		if ("revealDuration" in $$props) $$invalidate(6, revealDuration = $$props.revealDuration);
-    		if ("showKeyboard" in $$props) $$invalidate(25, showKeyboard = $$props.showKeyboard);
-    		if ("isLoaded" in $$props) $$invalidate(7, isLoaded = $$props.isLoaded);
-    		if ("keyboardStyle" in $$props) $$invalidate(8, keyboardStyle = $$props.keyboardStyle);
+    		if ('clues' in $$props) $$invalidate(23, clues = $$props.clues);
+    		if ('cells' in $$props) $$invalidate(0, cells = $$props.cells);
+    		if ('focusedDirection' in $$props) $$invalidate(22, focusedDirection = $$props.focusedDirection);
+    		if ('focusedCellIndex' in $$props) $$invalidate(1, focusedCellIndex = $$props.focusedCellIndex);
+    		if ('focusedCell' in $$props) $$invalidate(24, focusedCell = $$props.focusedCell);
+    		if ('isRevealing' in $$props) $$invalidate(2, isRevealing = $$props.isRevealing);
+    		if ('isChecking' in $$props) $$invalidate(3, isChecking = $$props.isChecking);
+    		if ('isDisableHighlight' in $$props) $$invalidate(4, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('stacked' in $$props) $$invalidate(5, stacked = $$props.stacked);
+    		if ('revealDuration' in $$props) $$invalidate(6, revealDuration = $$props.revealDuration);
+    		if ('showKeyboard' in $$props) $$invalidate(25, showKeyboard = $$props.showKeyboard);
+    		if ('isLoaded' in $$props) $$invalidate(7, isLoaded = $$props.isLoaded);
+    		if ('keyboardStyle' in $$props) $$invalidate(8, keyboardStyle = $$props.keyboardStyle);
     	};
 
     	$$self.$capture_state = () => ({
@@ -3741,44 +4185,39 @@ var app = (function () {
     		onFlipDirection,
     		onKeydown,
     		onClick,
-    		w,
-    		h,
+    		sortedCellsInDirection,
     		keyboardVisible,
-    		sortedCellsInDirection
+    		h,
+    		w
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("clues" in $$props) $$invalidate(23, clues = $$props.clues);
-    		if ("cells" in $$props) $$invalidate(0, cells = $$props.cells);
-    		if ("focusedDirection" in $$props) $$invalidate(22, focusedDirection = $$props.focusedDirection);
-    		if ("focusedCellIndex" in $$props) $$invalidate(1, focusedCellIndex = $$props.focusedCellIndex);
-    		if ("focusedCell" in $$props) $$invalidate(24, focusedCell = $$props.focusedCell);
-    		if ("isRevealing" in $$props) $$invalidate(2, isRevealing = $$props.isRevealing);
-    		if ("isChecking" in $$props) $$invalidate(3, isChecking = $$props.isChecking);
-    		if ("isDisableHighlight" in $$props) $$invalidate(4, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("stacked" in $$props) $$invalidate(5, stacked = $$props.stacked);
-    		if ("revealDuration" in $$props) $$invalidate(6, revealDuration = $$props.revealDuration);
-    		if ("showKeyboard" in $$props) $$invalidate(25, showKeyboard = $$props.showKeyboard);
-    		if ("isLoaded" in $$props) $$invalidate(7, isLoaded = $$props.isLoaded);
-    		if ("keyboardStyle" in $$props) $$invalidate(8, keyboardStyle = $$props.keyboardStyle);
-    		if ("element" in $$props) $$invalidate(9, element = $$props.element);
-    		if ("cellsHistoryIndex" in $$props) cellsHistoryIndex = $$props.cellsHistoryIndex;
-    		if ("cellsHistory" in $$props) cellsHistory = $$props.cellsHistory;
-    		if ("focusedCellIndexHistoryIndex" in $$props) focusedCellIndexHistoryIndex = $$props.focusedCellIndexHistoryIndex;
-    		if ("focusedCellIndexHistory" in $$props) focusedCellIndexHistory = $$props.focusedCellIndexHistory;
-    		if ("secondarilyFocusedCells" in $$props) $$invalidate(10, secondarilyFocusedCells = $$props.secondarilyFocusedCells);
-    		if ("isMobile" in $$props) $$invalidate(31, isMobile = $$props.isMobile);
-    		if ("isPuzzleFocused" in $$props) isPuzzleFocused = $$props.isPuzzleFocused;
-    		if ("w" in $$props) $$invalidate(11, w = $$props.w);
-    		if ("h" in $$props) $$invalidate(12, h = $$props.h);
-    		if ("keyboardVisible" in $$props) $$invalidate(13, keyboardVisible = $$props.keyboardVisible);
-    		if ("sortedCellsInDirection" in $$props) sortedCellsInDirection = $$props.sortedCellsInDirection;
+    		if ('clues' in $$props) $$invalidate(23, clues = $$props.clues);
+    		if ('cells' in $$props) $$invalidate(0, cells = $$props.cells);
+    		if ('focusedDirection' in $$props) $$invalidate(22, focusedDirection = $$props.focusedDirection);
+    		if ('focusedCellIndex' in $$props) $$invalidate(1, focusedCellIndex = $$props.focusedCellIndex);
+    		if ('focusedCell' in $$props) $$invalidate(24, focusedCell = $$props.focusedCell);
+    		if ('isRevealing' in $$props) $$invalidate(2, isRevealing = $$props.isRevealing);
+    		if ('isChecking' in $$props) $$invalidate(3, isChecking = $$props.isChecking);
+    		if ('isDisableHighlight' in $$props) $$invalidate(4, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('stacked' in $$props) $$invalidate(5, stacked = $$props.stacked);
+    		if ('revealDuration' in $$props) $$invalidate(6, revealDuration = $$props.revealDuration);
+    		if ('showKeyboard' in $$props) $$invalidate(25, showKeyboard = $$props.showKeyboard);
+    		if ('isLoaded' in $$props) $$invalidate(7, isLoaded = $$props.isLoaded);
+    		if ('keyboardStyle' in $$props) $$invalidate(8, keyboardStyle = $$props.keyboardStyle);
+    		if ('element' in $$props) $$invalidate(9, element = $$props.element);
+    		if ('cellsHistoryIndex' in $$props) cellsHistoryIndex = $$props.cellsHistoryIndex;
+    		if ('cellsHistory' in $$props) cellsHistory = $$props.cellsHistory;
+    		if ('focusedCellIndexHistoryIndex' in $$props) focusedCellIndexHistoryIndex = $$props.focusedCellIndexHistoryIndex;
+    		if ('focusedCellIndexHistory' in $$props) focusedCellIndexHistory = $$props.focusedCellIndexHistory;
+    		if ('secondarilyFocusedCells' in $$props) $$invalidate(10, secondarilyFocusedCells = $$props.secondarilyFocusedCells);
+    		if ('isMobile' in $$props) $$invalidate(26, isMobile = $$props.isMobile);
+    		if ('isPuzzleFocused' in $$props) isPuzzleFocused = $$props.isPuzzleFocused;
+    		if ('sortedCellsInDirection' in $$props) sortedCellsInDirection = $$props.sortedCellsInDirection;
+    		if ('keyboardVisible' in $$props) $$invalidate(11, keyboardVisible = $$props.keyboardVisible);
+    		if ('h' in $$props) $$invalidate(12, h = $$props.h);
+    		if ('w' in $$props) $$invalidate(13, w = $$props.w);
     	};
-
-    	let w;
-    	let h;
-    	let keyboardVisible;
-    	let sortedCellsInDirection;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -3786,25 +4225,25 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty[0] & /*cells*/ 1) {
-    			 $$invalidate(11, w = Math.max(...cells.map(d => d.x)) + 1);
+    			$$invalidate(13, w = Math.max(...cells.map(d => d.x)) + 1);
     		}
 
     		if ($$self.$$.dirty[0] & /*cells*/ 1) {
-    			 $$invalidate(12, h = Math.max(...cells.map(d => d.y)) + 1);
+    			$$invalidate(12, h = Math.max(...cells.map(d => d.y)) + 1);
     		}
 
-    		if ($$self.$$.dirty[0] & /*showKeyboard*/ 33554432 | $$self.$$.dirty[1] & /*isMobile*/ 1) {
-    			 $$invalidate(13, keyboardVisible = typeof showKeyboard === "boolean"
+    		if ($$self.$$.dirty[0] & /*showKeyboard, isMobile*/ 100663296) {
+    			$$invalidate(11, keyboardVisible = typeof showKeyboard === "boolean"
     			? showKeyboard
     			: isMobile);
     		}
 
     		if ($$self.$$.dirty[0] & /*cells, focusedCellIndex, focusedDirection*/ 4194307) {
-    			 (updateSecondarilyFocusedCells());
+    			(updateSecondarilyFocusedCells());
     		}
 
     		if ($$self.$$.dirty[0] & /*cells, focusedDirection*/ 4194305) {
-    			 sortedCellsInDirection = [...cells].sort((a, b) => focusedDirection == "down"
+    			sortedCellsInDirection = [...cells].sort((a, b) => focusedDirection == "down"
     			? a.x - b.x || a.y - b.y
     			: a.y - b.y || a.x - b.x);
     		}
@@ -3822,9 +4261,9 @@ var app = (function () {
     		keyboardStyle,
     		element,
     		secondarilyFocusedCells,
-    		w,
-    		h,
     		keyboardVisible,
+    		h,
+    		w,
     		onCellUpdate,
     		onHistoricalChange,
     		onFocusCell,
@@ -3837,6 +4276,7 @@ var app = (function () {
     		clues,
     		focusedCell,
     		showKeyboard,
+    		isMobile,
     		section_binding
     	];
     }
@@ -3848,8 +4288,8 @@ var app = (function () {
     		init(
     			this,
     			options,
-    			instance$3,
-    			create_fragment$3,
+    			instance$8,
+    			create_fragment$8,
     			safe_not_equal,
     			{
     				clues: 23,
@@ -3866,6 +4306,7 @@ var app = (function () {
     				isLoaded: 7,
     				keyboardStyle: 8
     			},
+    			null,
     			[-1, -1]
     		);
 
@@ -3873,59 +4314,8 @@ var app = (function () {
     			component: this,
     			tagName: "Puzzle",
     			options,
-    			id: create_fragment$3.name
+    			id: create_fragment$8.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*clues*/ ctx[23] === undefined && !("clues" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'clues'");
-    		}
-
-    		if (/*cells*/ ctx[0] === undefined && !("cells" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'cells'");
-    		}
-
-    		if (/*focusedDirection*/ ctx[22] === undefined && !("focusedDirection" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'focusedDirection'");
-    		}
-
-    		if (/*focusedCellIndex*/ ctx[1] === undefined && !("focusedCellIndex" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'focusedCellIndex'");
-    		}
-
-    		if (/*focusedCell*/ ctx[24] === undefined && !("focusedCell" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'focusedCell'");
-    		}
-
-    		if (/*isRevealing*/ ctx[2] === undefined && !("isRevealing" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'isRevealing'");
-    		}
-
-    		if (/*isChecking*/ ctx[3] === undefined && !("isChecking" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'isChecking'");
-    		}
-
-    		if (/*isDisableHighlight*/ ctx[4] === undefined && !("isDisableHighlight" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'isDisableHighlight'");
-    		}
-
-    		if (/*stacked*/ ctx[5] === undefined && !("stacked" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'stacked'");
-    		}
-
-    		if (/*showKeyboard*/ ctx[25] === undefined && !("showKeyboard" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'showKeyboard'");
-    		}
-
-    		if (/*isLoaded*/ ctx[7] === undefined && !("isLoaded" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'isLoaded'");
-    		}
-
-    		if (/*keyboardStyle*/ ctx[8] === undefined && !("keyboardStyle" in props)) {
-    			console.warn("<Puzzle> was created without expected prop 'keyboardStyle'");
-    		}
     	}
 
     	get clues() {
@@ -4052,10 +4442,10 @@ var app = (function () {
       };
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clue.svelte generated by Svelte v3.29.0 */
-    const file$4 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clue.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clue.svelte generated by Svelte v3.59.2 */
+    const file$7 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clue.svelte";
 
-    function create_fragment$4(ctx) {
+    function create_fragment$7(ctx) {
     	let li;
     	let button;
     	let strong;
@@ -4094,22 +4484,22 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(strong, "class", "svelte-hozmon");
-    			add_location(strong, file$4, 25, 4, 666);
+    			add_location(strong, file$7, 25, 4, 666);
     			attr_dev(button, "class", button_class_value = "clue " + /*custom*/ ctx[2] + " svelte-hozmon");
     			toggle_class(button, "is-disable-highlight", /*isDisableHighlight*/ ctx[6]);
     			toggle_class(button, "is-number-focused", /*isNumberFocused*/ ctx[4]);
     			toggle_class(button, "is-direction-focused", /*isDirectionFocused*/ ctx[5]);
     			toggle_class(button, "is-filled", /*isFilled*/ ctx[3]);
-    			add_location(button, file$4, 18, 2, 413);
-    			add_location(li, file$4, 17, 0, 357);
+    			add_location(button, file$7, 18, 2, 413);
+    			add_location(li, file$7, 17, 0, 357);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, li, anchor);
-    			append_dev(li, button);
-    			append_dev(button, strong);
-    			append_dev(strong, t0);
-    			append_dev(button, t1);
-    			append_dev(button, t2);
+    			insert_hydration_dev(target, li, anchor);
+    			append_hydration_dev(li, button);
+    			append_hydration_dev(button, strong);
+    			append_hydration_dev(strong, t0);
+    			append_hydration_dev(button, t1);
+    			append_hydration_dev(button, t2);
     			/*li_binding*/ ctx[10](li);
 
     			if (!mounted) {
@@ -4120,6 +4510,7 @@ var app = (function () {
     						function () {
     							if (is_function(/*onFocus*/ ctx[7])) /*onFocus*/ ctx[7].apply(this, arguments);
     						},
+    						false,
     						false,
     						false,
     						false
@@ -4169,7 +4560,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$4.name,
+    		id: create_fragment$7.name,
     		type: "component",
     		source: "",
     		ctx
@@ -4178,9 +4569,10 @@ var app = (function () {
     	return block;
     }
 
-    function instance$4($$self, $$props, $$invalidate) {
+    function instance$7($$self, $$props, $$invalidate) {
+    	let isFocused;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Clue", slots, []);
+    	validate_slots('Clue', slots, []);
     	let { number } = $$props;
     	let { clue } = $$props;
     	let { custom } = $$props;
@@ -4195,37 +4587,55 @@ var app = (function () {
 
     	let element;
 
+    	$$self.$$.on_mount.push(function () {
+    		if (number === undefined && !('number' in $$props || $$self.$$.bound[$$self.$$.props['number']])) {
+    			console.warn("<Clue> was created without expected prop 'number'");
+    		}
+
+    		if (clue === undefined && !('clue' in $$props || $$self.$$.bound[$$self.$$.props['clue']])) {
+    			console.warn("<Clue> was created without expected prop 'clue'");
+    		}
+
+    		if (custom === undefined && !('custom' in $$props || $$self.$$.bound[$$self.$$.props['custom']])) {
+    			console.warn("<Clue> was created without expected prop 'custom'");
+    		}
+
+    		if (isFilled === undefined && !('isFilled' in $$props || $$self.$$.bound[$$self.$$.props['isFilled']])) {
+    			console.warn("<Clue> was created without expected prop 'isFilled'");
+    		}
+    	});
+
     	const writable_props = [
-    		"number",
-    		"clue",
-    		"custom",
-    		"isFilled",
-    		"isNumberFocused",
-    		"isDirectionFocused",
-    		"isDisableHighlight",
-    		"onFocus"
+    		'number',
+    		'clue',
+    		'custom',
+    		'isFilled',
+    		'isNumberFocused',
+    		'isDirectionFocused',
+    		'isDisableHighlight',
+    		'onFocus'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Clue> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Clue> was created with unknown prop '${key}'`);
     	});
 
     	function li_binding($$value) {
-    		binding_callbacks[$$value ? "unshift" : "push"](() => {
+    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
     			element = $$value;
     			$$invalidate(8, element);
     		});
     	}
 
     	$$self.$$set = $$props => {
-    		if ("number" in $$props) $$invalidate(0, number = $$props.number);
-    		if ("clue" in $$props) $$invalidate(1, clue = $$props.clue);
-    		if ("custom" in $$props) $$invalidate(2, custom = $$props.custom);
-    		if ("isFilled" in $$props) $$invalidate(3, isFilled = $$props.isFilled);
-    		if ("isNumberFocused" in $$props) $$invalidate(4, isNumberFocused = $$props.isNumberFocused);
-    		if ("isDirectionFocused" in $$props) $$invalidate(5, isDirectionFocused = $$props.isDirectionFocused);
-    		if ("isDisableHighlight" in $$props) $$invalidate(6, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("onFocus" in $$props) $$invalidate(7, onFocus = $$props.onFocus);
+    		if ('number' in $$props) $$invalidate(0, number = $$props.number);
+    		if ('clue' in $$props) $$invalidate(1, clue = $$props.clue);
+    		if ('custom' in $$props) $$invalidate(2, custom = $$props.custom);
+    		if ('isFilled' in $$props) $$invalidate(3, isFilled = $$props.isFilled);
+    		if ('isNumberFocused' in $$props) $$invalidate(4, isNumberFocused = $$props.isNumberFocused);
+    		if ('isDirectionFocused' in $$props) $$invalidate(5, isDirectionFocused = $$props.isDirectionFocused);
+    		if ('isDisableHighlight' in $$props) $$invalidate(6, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('onFocus' in $$props) $$invalidate(7, onFocus = $$props.onFocus);
     	};
 
     	$$self.$capture_state = () => ({
@@ -4243,19 +4653,17 @@ var app = (function () {
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("number" in $$props) $$invalidate(0, number = $$props.number);
-    		if ("clue" in $$props) $$invalidate(1, clue = $$props.clue);
-    		if ("custom" in $$props) $$invalidate(2, custom = $$props.custom);
-    		if ("isFilled" in $$props) $$invalidate(3, isFilled = $$props.isFilled);
-    		if ("isNumberFocused" in $$props) $$invalidate(4, isNumberFocused = $$props.isNumberFocused);
-    		if ("isDirectionFocused" in $$props) $$invalidate(5, isDirectionFocused = $$props.isDirectionFocused);
-    		if ("isDisableHighlight" in $$props) $$invalidate(6, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("onFocus" in $$props) $$invalidate(7, onFocus = $$props.onFocus);
-    		if ("element" in $$props) $$invalidate(8, element = $$props.element);
-    		if ("isFocused" in $$props) $$invalidate(9, isFocused = $$props.isFocused);
+    		if ('number' in $$props) $$invalidate(0, number = $$props.number);
+    		if ('clue' in $$props) $$invalidate(1, clue = $$props.clue);
+    		if ('custom' in $$props) $$invalidate(2, custom = $$props.custom);
+    		if ('isFilled' in $$props) $$invalidate(3, isFilled = $$props.isFilled);
+    		if ('isNumberFocused' in $$props) $$invalidate(4, isNumberFocused = $$props.isNumberFocused);
+    		if ('isDirectionFocused' in $$props) $$invalidate(5, isDirectionFocused = $$props.isDirectionFocused);
+    		if ('isDisableHighlight' in $$props) $$invalidate(6, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('onFocus' in $$props) $$invalidate(7, onFocus = $$props.onFocus);
+    		if ('element' in $$props) $$invalidate(8, element = $$props.element);
+    		if ('isFocused' in $$props) $$invalidate(9, isFocused = $$props.isFocused);
     	};
-
-    	let isFocused;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -4263,7 +4671,7 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty & /*isNumberFocused*/ 16) {
-    			 $$invalidate(9, isFocused = isNumberFocused);
+    			$$invalidate(9, isFocused = isNumberFocused);
     		}
     	};
 
@@ -4286,7 +4694,7 @@ var app = (function () {
     	constructor(options) {
     		super(options);
 
-    		init(this, options, instance$4, create_fragment$4, safe_not_equal, {
+    		init(this, options, instance$7, create_fragment$7, safe_not_equal, {
     			number: 0,
     			clue: 1,
     			custom: 2,
@@ -4301,27 +4709,8 @@ var app = (function () {
     			component: this,
     			tagName: "Clue",
     			options,
-    			id: create_fragment$4.name
+    			id: create_fragment$7.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*number*/ ctx[0] === undefined && !("number" in props)) {
-    			console.warn("<Clue> was created without expected prop 'number'");
-    		}
-
-    		if (/*clue*/ ctx[1] === undefined && !("clue" in props)) {
-    			console.warn("<Clue> was created without expected prop 'clue'");
-    		}
-
-    		if (/*custom*/ ctx[2] === undefined && !("custom" in props)) {
-    			console.warn("<Clue> was created without expected prop 'custom'");
-    		}
-
-    		if (/*isFilled*/ ctx[3] === undefined && !("isFilled" in props)) {
-    			console.warn("<Clue> was created without expected prop 'isFilled'");
-    		}
     	}
 
     	get number() {
@@ -4389,22 +4778,22 @@ var app = (function () {
     	}
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueList.svelte generated by Svelte v3.29.0 */
-    const file$5 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueList.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueList.svelte generated by Svelte v3.59.2 */
+    const file$6 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueList.svelte";
 
-    function get_each_context$3(ctx, list, i) {
+    function get_each_context$2(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[7] = list[i];
     	return child_ctx;
     }
 
     // (15:4) {#each clues as clue}
-    function create_each_block$3(ctx) {
+    function create_each_block$2(ctx) {
     	let clue;
     	let current;
 
-    	function func(...args) {
-    		return /*func*/ ctx[6](/*clue*/ ctx[7], ...args);
+    	function func() {
+    		return /*func*/ ctx[6](/*clue*/ ctx[7]);
     	}
 
     	clue = new Clue({
@@ -4461,7 +4850,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block$3.name,
+    		id: create_each_block$2.name,
     		type: "each",
     		source: "(15:4) {#each clues as clue}",
     		ctx
@@ -4470,7 +4859,7 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$5(ctx) {
+    function create_fragment$6(ctx) {
     	let p;
     	let t0;
     	let t1;
@@ -4482,7 +4871,7 @@ var app = (function () {
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$3(get_each_context$3(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$2(get_each_context$2(ctx, each_value, i));
     	}
 
     	const out = i => transition_out(each_blocks[i], 1, 1, () => {
@@ -4524,21 +4913,23 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(p, "class", "svelte-16s2wyn");
-    			add_location(p, file$5, 11, 0, 226);
+    			add_location(p, file$6, 11, 0, 226);
     			attr_dev(ul, "class", "svelte-16s2wyn");
-    			add_location(ul, file$5, 13, 2, 266);
+    			add_location(ul, file$6, 13, 2, 266);
     			attr_dev(div, "class", "list svelte-16s2wyn");
-    			add_location(div, file$5, 12, 0, 245);
+    			add_location(div, file$6, 12, 0, 245);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			append_dev(p, t0);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, div, anchor);
-    			append_dev(div, ul);
+    			insert_hydration_dev(target, p, anchor);
+    			append_hydration_dev(p, t0);
+    			insert_hydration_dev(target, t1, anchor);
+    			insert_hydration_dev(target, div, anchor);
+    			append_hydration_dev(div, ul);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(ul, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(ul, null);
+    				}
     			}
 
     			current = true;
@@ -4552,13 +4943,13 @@ var app = (function () {
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$3(ctx, each_value, i);
+    					const child_ctx = get_each_context$2(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     						transition_in(each_blocks[i], 1);
     					} else {
-    						each_blocks[i] = create_each_block$3(child_ctx);
+    						each_blocks[i] = create_each_block$2(child_ctx);
     						each_blocks[i].c();
     						transition_in(each_blocks[i], 1);
     						each_blocks[i].m(ul, null);
@@ -4602,7 +4993,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$5.name,
+    		id: create_fragment$6.name,
     		type: "component",
     		source: "",
     		ctx
@@ -4611,9 +5002,9 @@ var app = (function () {
     	return block;
     }
 
-    function instance$5($$self, $$props, $$invalidate) {
+    function instance$6($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("ClueList", slots, []);
+    	validate_slots('ClueList', slots, []);
     	let { direction } = $$props;
     	let { clues } = $$props;
     	let { focusedClueNumbers } = $$props;
@@ -4621,28 +5012,54 @@ var app = (function () {
     	let { onClueFocus } = $$props;
     	let { isDisableHighlight } = $$props;
 
+    	$$self.$$.on_mount.push(function () {
+    		if (direction === undefined && !('direction' in $$props || $$self.$$.bound[$$self.$$.props['direction']])) {
+    			console.warn("<ClueList> was created without expected prop 'direction'");
+    		}
+
+    		if (clues === undefined && !('clues' in $$props || $$self.$$.bound[$$self.$$.props['clues']])) {
+    			console.warn("<ClueList> was created without expected prop 'clues'");
+    		}
+
+    		if (focusedClueNumbers === undefined && !('focusedClueNumbers' in $$props || $$self.$$.bound[$$self.$$.props['focusedClueNumbers']])) {
+    			console.warn("<ClueList> was created without expected prop 'focusedClueNumbers'");
+    		}
+
+    		if (isDirectionFocused === undefined && !('isDirectionFocused' in $$props || $$self.$$.bound[$$self.$$.props['isDirectionFocused']])) {
+    			console.warn("<ClueList> was created without expected prop 'isDirectionFocused'");
+    		}
+
+    		if (onClueFocus === undefined && !('onClueFocus' in $$props || $$self.$$.bound[$$self.$$.props['onClueFocus']])) {
+    			console.warn("<ClueList> was created without expected prop 'onClueFocus'");
+    		}
+
+    		if (isDisableHighlight === undefined && !('isDisableHighlight' in $$props || $$self.$$.bound[$$self.$$.props['isDisableHighlight']])) {
+    			console.warn("<ClueList> was created without expected prop 'isDisableHighlight'");
+    		}
+    	});
+
     	const writable_props = [
-    		"direction",
-    		"clues",
-    		"focusedClueNumbers",
-    		"isDirectionFocused",
-    		"onClueFocus",
-    		"isDisableHighlight"
+    		'direction',
+    		'clues',
+    		'focusedClueNumbers',
+    		'isDirectionFocused',
+    		'onClueFocus',
+    		'isDisableHighlight'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<ClueList> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<ClueList> was created with unknown prop '${key}'`);
     	});
 
     	const func = clue => onClueFocus(clue);
 
     	$$self.$$set = $$props => {
-    		if ("direction" in $$props) $$invalidate(0, direction = $$props.direction);
-    		if ("clues" in $$props) $$invalidate(1, clues = $$props.clues);
-    		if ("focusedClueNumbers" in $$props) $$invalidate(2, focusedClueNumbers = $$props.focusedClueNumbers);
-    		if ("isDirectionFocused" in $$props) $$invalidate(3, isDirectionFocused = $$props.isDirectionFocused);
-    		if ("onClueFocus" in $$props) $$invalidate(4, onClueFocus = $$props.onClueFocus);
-    		if ("isDisableHighlight" in $$props) $$invalidate(5, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('direction' in $$props) $$invalidate(0, direction = $$props.direction);
+    		if ('clues' in $$props) $$invalidate(1, clues = $$props.clues);
+    		if ('focusedClueNumbers' in $$props) $$invalidate(2, focusedClueNumbers = $$props.focusedClueNumbers);
+    		if ('isDirectionFocused' in $$props) $$invalidate(3, isDirectionFocused = $$props.isDirectionFocused);
+    		if ('onClueFocus' in $$props) $$invalidate(4, onClueFocus = $$props.onClueFocus);
+    		if ('isDisableHighlight' in $$props) $$invalidate(5, isDisableHighlight = $$props.isDisableHighlight);
     	};
 
     	$$self.$capture_state = () => ({
@@ -4656,12 +5073,12 @@ var app = (function () {
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("direction" in $$props) $$invalidate(0, direction = $$props.direction);
-    		if ("clues" in $$props) $$invalidate(1, clues = $$props.clues);
-    		if ("focusedClueNumbers" in $$props) $$invalidate(2, focusedClueNumbers = $$props.focusedClueNumbers);
-    		if ("isDirectionFocused" in $$props) $$invalidate(3, isDirectionFocused = $$props.isDirectionFocused);
-    		if ("onClueFocus" in $$props) $$invalidate(4, onClueFocus = $$props.onClueFocus);
-    		if ("isDisableHighlight" in $$props) $$invalidate(5, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('direction' in $$props) $$invalidate(0, direction = $$props.direction);
+    		if ('clues' in $$props) $$invalidate(1, clues = $$props.clues);
+    		if ('focusedClueNumbers' in $$props) $$invalidate(2, focusedClueNumbers = $$props.focusedClueNumbers);
+    		if ('isDirectionFocused' in $$props) $$invalidate(3, isDirectionFocused = $$props.isDirectionFocused);
+    		if ('onClueFocus' in $$props) $$invalidate(4, onClueFocus = $$props.onClueFocus);
+    		if ('isDisableHighlight' in $$props) $$invalidate(5, isDisableHighlight = $$props.isDisableHighlight);
     	};
 
     	if ($$props && "$$inject" in $$props) {
@@ -4683,7 +5100,7 @@ var app = (function () {
     	constructor(options) {
     		super(options);
 
-    		init(this, options, instance$5, create_fragment$5, safe_not_equal, {
+    		init(this, options, instance$6, create_fragment$6, safe_not_equal, {
     			direction: 0,
     			clues: 1,
     			focusedClueNumbers: 2,
@@ -4696,35 +5113,8 @@ var app = (function () {
     			component: this,
     			tagName: "ClueList",
     			options,
-    			id: create_fragment$5.name
+    			id: create_fragment$6.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*direction*/ ctx[0] === undefined && !("direction" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'direction'");
-    		}
-
-    		if (/*clues*/ ctx[1] === undefined && !("clues" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'clues'");
-    		}
-
-    		if (/*focusedClueNumbers*/ ctx[2] === undefined && !("focusedClueNumbers" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'focusedClueNumbers'");
-    		}
-
-    		if (/*isDirectionFocused*/ ctx[3] === undefined && !("isDirectionFocused" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'isDirectionFocused'");
-    		}
-
-    		if (/*onClueFocus*/ ctx[4] === undefined && !("onClueFocus" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'onClueFocus'");
-    		}
-
-    		if (/*isDisableHighlight*/ ctx[5] === undefined && !("isDisableHighlight" in props)) {
-    			console.warn("<ClueList> was created without expected prop 'isDisableHighlight'");
-    		}
     	}
 
     	get direction() {
@@ -4776,10 +5166,10 @@ var app = (function () {
     	}
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueBar.svelte generated by Svelte v3.29.0 */
-    const file$6 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueBar.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueBar.svelte generated by Svelte v3.59.2 */
+    const file$5 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/ClueBar.svelte";
 
-    function create_fragment$6(ctx) {
+    function create_fragment$5(ctx) {
     	let div;
     	let button0;
     	let svg0;
@@ -4803,7 +5193,7 @@ var app = (function () {
     			polyline0 = svg_element("polyline");
     			t0 = space();
     			p = element("p");
-    			t1 = text(/*clue*/ ctx[1]);
+    			t1 = text(/*clue*/ ctx[2]);
     			t2 = space();
     			button1 = element("button");
     			svg1 = svg_element("svg");
@@ -4816,56 +5206,46 @@ var app = (function () {
     			button0 = claim_element(div_nodes, "BUTTON", { class: true });
     			var button0_nodes = children(button0);
 
-    			svg0 = claim_element(
-    				button0_nodes,
-    				"svg",
-    				{
-    					width: true,
-    					height: true,
-    					viewBox: true,
-    					fill: true,
-    					stroke: true,
-    					"stroke-width": true,
-    					"stroke-linecap": true,
-    					"stroke-linejoin": true,
-    					class: true
-    				},
-    				1
-    			);
+    			svg0 = claim_svg_element(button0_nodes, "svg", {
+    				width: true,
+    				height: true,
+    				viewBox: true,
+    				fill: true,
+    				stroke: true,
+    				"stroke-width": true,
+    				"stroke-linecap": true,
+    				"stroke-linejoin": true,
+    				class: true
+    			});
 
     			var svg0_nodes = children(svg0);
-    			polyline0 = claim_element(svg0_nodes, "polyline", { points: true }, 1);
+    			polyline0 = claim_svg_element(svg0_nodes, "polyline", { points: true });
     			children(polyline0).forEach(detach_dev);
     			svg0_nodes.forEach(detach_dev);
     			button0_nodes.forEach(detach_dev);
     			t0 = claim_space(div_nodes);
     			p = claim_element(div_nodes, "P", { class: true });
     			var p_nodes = children(p);
-    			t1 = claim_text(p_nodes, /*clue*/ ctx[1]);
+    			t1 = claim_text(p_nodes, /*clue*/ ctx[2]);
     			p_nodes.forEach(detach_dev);
     			t2 = claim_space(div_nodes);
     			button1 = claim_element(div_nodes, "BUTTON", { class: true });
     			var button1_nodes = children(button1);
 
-    			svg1 = claim_element(
-    				button1_nodes,
-    				"svg",
-    				{
-    					width: true,
-    					height: true,
-    					viewBox: true,
-    					fill: true,
-    					stroke: true,
-    					"stroke-width": true,
-    					"stroke-linecap": true,
-    					"stroke-linejoin": true,
-    					class: true
-    				},
-    				1
-    			);
+    			svg1 = claim_svg_element(button1_nodes, "svg", {
+    				width: true,
+    				height: true,
+    				viewBox: true,
+    				fill: true,
+    				stroke: true,
+    				"stroke-width": true,
+    				"stroke-linecap": true,
+    				"stroke-linejoin": true,
+    				class: true
+    			});
 
     			var svg1_nodes = children(svg1);
-    			polyline1 = claim_element(svg1_nodes, "polyline", { points: true }, 1);
+    			polyline1 = claim_svg_element(svg1_nodes, "polyline", { points: true });
     			children(polyline1).forEach(detach_dev);
     			svg1_nodes.forEach(detach_dev);
     			button1_nodes.forEach(detach_dev);
@@ -4874,7 +5254,7 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(polyline0, "points", "15 18 9 12 15 6");
-    			add_location(polyline0, file$6, 21, 6, 571);
+    			add_location(polyline0, file$5, 21, 6, 571);
     			attr_dev(svg0, "width", "24");
     			attr_dev(svg0, "height", "24");
     			attr_dev(svg0, "viewBox", "0 0 24 24");
@@ -4884,13 +5264,13 @@ var app = (function () {
     			attr_dev(svg0, "stroke-linecap", "round");
     			attr_dev(svg0, "stroke-linejoin", "round");
     			attr_dev(svg0, "class", "feather feather-chevron-left");
-    			add_location(svg0, file$6, 11, 4, 327);
+    			add_location(svg0, file$5, 11, 4, 327);
     			attr_dev(button0, "class", "svelte-irjjhy");
-    			add_location(button0, file$6, 10, 2, 251);
+    			add_location(button0, file$5, 10, 2, 251);
     			attr_dev(p, "class", "svelte-irjjhy");
-    			add_location(p, file$6, 24, 2, 643);
+    			add_location(p, file$5, 24, 2, 643);
     			attr_dev(polyline1, "points", "9 18 15 12 9 6");
-    			add_location(polyline1, file$6, 36, 6, 980);
+    			add_location(polyline1, file$5, 36, 6, 980);
     			attr_dev(svg1, "width", "24");
     			attr_dev(svg1, "height", "24");
     			attr_dev(svg1, "viewBox", "0 0 24 24");
@@ -4900,38 +5280,38 @@ var app = (function () {
     			attr_dev(svg1, "stroke-linecap", "round");
     			attr_dev(svg1, "stroke-linejoin", "round");
     			attr_dev(svg1, "class", "feather feather-chevron-right");
-    			add_location(svg1, file$6, 26, 4, 735);
+    			add_location(svg1, file$5, 26, 4, 735);
     			attr_dev(button1, "class", "svelte-irjjhy");
-    			add_location(button1, file$6, 25, 2, 659);
-    			attr_dev(div, "class", div_class_value = "bar " + /*custom*/ ctx[2] + " svelte-irjjhy");
-    			add_location(div, file$6, 9, 0, 222);
+    			add_location(button1, file$5, 25, 2, 659);
+    			attr_dev(div, "class", div_class_value = "bar " + /*custom*/ ctx[1] + " svelte-irjjhy");
+    			add_location(div, file$5, 9, 0, 222);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
-    			append_dev(div, button0);
-    			append_dev(button0, svg0);
-    			append_dev(svg0, polyline0);
-    			append_dev(div, t0);
-    			append_dev(div, p);
-    			append_dev(p, t1);
-    			append_dev(div, t2);
-    			append_dev(div, button1);
-    			append_dev(button1, svg1);
-    			append_dev(svg1, polyline1);
+    			insert_hydration_dev(target, div, anchor);
+    			append_hydration_dev(div, button0);
+    			append_hydration_dev(button0, svg0);
+    			append_hydration_dev(svg0, polyline0);
+    			append_hydration_dev(div, t0);
+    			append_hydration_dev(div, p);
+    			append_hydration_dev(p, t1);
+    			append_hydration_dev(div, t2);
+    			append_hydration_dev(div, button1);
+    			append_hydration_dev(button1, svg1);
+    			append_hydration_dev(svg1, polyline1);
 
     			if (!mounted) {
     				dispose = [
-    					listen_dev(button0, "click", /*click_handler*/ ctx[4], false, false, false),
-    					listen_dev(button1, "click", /*click_handler_1*/ ctx[5], false, false, false)
+    					listen_dev(button0, "click", /*click_handler*/ ctx[4], false, false, false, false),
+    					listen_dev(button1, "click", /*click_handler_1*/ ctx[5], false, false, false, false)
     				];
 
     				mounted = true;
     			}
     		},
     		p: function update(ctx, [dirty]) {
-    			if (dirty & /*clue*/ 2) set_data_dev(t1, /*clue*/ ctx[1]);
+    			if (dirty & /*clue*/ 4) set_data_dev(t1, /*clue*/ ctx[2]);
 
-    			if (dirty & /*custom*/ 4 && div_class_value !== (div_class_value = "bar " + /*custom*/ ctx[2] + " svelte-irjjhy")) {
+    			if (dirty & /*custom*/ 2 && div_class_value !== (div_class_value = "bar " + /*custom*/ ctx[1] + " svelte-irjjhy")) {
     				attr_dev(div, "class", div_class_value);
     			}
     		},
@@ -4946,7 +5326,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$6.name,
+    		id: create_fragment$5.name,
     		type: "component",
     		source: "",
     		ctx
@@ -4955,40 +5335,39 @@ var app = (function () {
     	return block;
     }
 
-    function instance$6($$self, $$props, $$invalidate) {
+    function instance$5($$self, $$props, $$invalidate) {
+    	let clue;
+    	let custom;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("ClueBar", slots, []);
+    	validate_slots('ClueBar', slots, []);
     	const dispatch = createEventDispatcher();
     	let { currentClue = {} } = $$props;
-    	const writable_props = ["currentClue"];
+    	const writable_props = ['currentClue'];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<ClueBar> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<ClueBar> was created with unknown prop '${key}'`);
     	});
 
-    	const click_handler = () => dispatch("nextClue", currentClue.index - 1);
-    	const click_handler_1 = () => dispatch("nextClue", currentClue.index + 1);
+    	const click_handler = () => dispatch('nextClue', currentClue.index - 1);
+    	const click_handler_1 = () => dispatch('nextClue', currentClue.index + 1);
 
     	$$self.$$set = $$props => {
-    		if ("currentClue" in $$props) $$invalidate(0, currentClue = $$props.currentClue);
+    		if ('currentClue' in $$props) $$invalidate(0, currentClue = $$props.currentClue);
     	};
 
     	$$self.$capture_state = () => ({
     		createEventDispatcher,
     		dispatch,
     		currentClue,
-    		clue,
-    		custom
+    		custom,
+    		clue
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("currentClue" in $$props) $$invalidate(0, currentClue = $$props.currentClue);
-    		if ("clue" in $$props) $$invalidate(1, clue = $$props.clue);
-    		if ("custom" in $$props) $$invalidate(2, custom = $$props.custom);
+    		if ('currentClue' in $$props) $$invalidate(0, currentClue = $$props.currentClue);
+    		if ('custom' in $$props) $$invalidate(1, custom = $$props.custom);
+    		if ('clue' in $$props) $$invalidate(2, clue = $$props.clue);
     	};
-
-    	let clue;
-    	let custom;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -4996,27 +5375,27 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty & /*currentClue*/ 1) {
-    			 $$invalidate(1, clue = currentClue["clue"]);
+    			$$invalidate(2, clue = currentClue["clue"]);
     		}
 
     		if ($$self.$$.dirty & /*currentClue*/ 1) {
-    			 $$invalidate(2, custom = currentClue["custom"] || "");
+    			$$invalidate(1, custom = currentClue["custom"] || "");
     		}
     	};
 
-    	return [currentClue, clue, custom, dispatch, click_handler, click_handler_1];
+    	return [currentClue, custom, clue, dispatch, click_handler, click_handler_1];
     }
 
     class ClueBar extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$6, create_fragment$6, safe_not_equal, { currentClue: 0 });
+    		init(this, options, instance$5, create_fragment$5, safe_not_equal, { currentClue: 0 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "ClueBar",
     			options,
-    			id: create_fragment$6.name
+    			id: create_fragment$5.name
     		});
     	}
 
@@ -5029,17 +5408,17 @@ var app = (function () {
     	}
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clues.svelte generated by Svelte v3.29.0 */
-    const file$7 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clues.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clues.svelte generated by Svelte v3.59.2 */
+    const file$4 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Clues.svelte";
 
-    function get_each_context$4(ctx, list, i) {
+    function get_each_context$1(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[13] = list[i];
     	return child_ctx;
     }
 
     // (42:4) {#each ['across', 'down'] as direction}
-    function create_each_block$4(ctx) {
+    function create_each_block$1(ctx) {
     	let cluelist;
     	let current;
 
@@ -5095,7 +5474,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block$4.name,
+    		id: create_each_block$1.name,
     		type: "each",
     		source: "(42:4) {#each ['across', 'down'] as direction}",
     		ctx
@@ -5104,7 +5483,7 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$7(ctx) {
+    function create_fragment$4(ctx) {
     	let section;
     	let div0;
     	let cluebar;
@@ -5118,12 +5497,12 @@ var app = (function () {
     		});
 
     	cluebar.$on("nextClue", /*onNextClue*/ ctx[8]);
-    	let each_value = ["across", "down"];
+    	let each_value = ['across', 'down'];
     	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < 2; i += 1) {
-    		each_blocks[i] = create_each_block$4(get_each_context$4(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
     	}
 
     	const out = i => transition_out(each_blocks[i], 1, 1, () => {
@@ -5165,23 +5544,25 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div0, "class", "clues--stacked svelte-fisq29");
-    			add_location(div0, file$7, 36, 2, 971);
+    			add_location(div0, file$4, 36, 2, 971);
     			attr_dev(div1, "class", "clues--list svelte-fisq29");
-    			add_location(div1, file$7, 40, 2, 1069);
+    			add_location(div1, file$4, 40, 2, 1069);
     			attr_dev(section, "class", "clues svelte-fisq29");
     			toggle_class(section, "stacked", /*stacked*/ ctx[2]);
     			toggle_class(section, "is-loaded", /*isLoaded*/ ctx[4]);
-    			add_location(section, file$7, 35, 0, 902);
+    			add_location(section, file$4, 35, 0, 902);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, section, anchor);
-    			append_dev(section, div0);
+    			insert_hydration_dev(target, section, anchor);
+    			append_hydration_dev(section, div0);
     			mount_component(cluebar, div0, null);
-    			append_dev(section, t);
-    			append_dev(section, div1);
+    			append_hydration_dev(section, t);
+    			append_hydration_dev(section, div1);
 
     			for (let i = 0; i < 2; i += 1) {
-    				each_blocks[i].m(div1, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(div1, null);
+    				}
     			}
 
     			current = true;
@@ -5192,18 +5573,18 @@ var app = (function () {
     			cluebar.$set(cluebar_changes);
 
     			if (dirty & /*focusedClueNumbers, clues, focusedDirection, isDisableHighlight, onClueFocus*/ 171) {
-    				each_value = ["across", "down"];
+    				each_value = ['across', 'down'];
     				validate_each_argument(each_value);
     				let i;
 
     				for (i = 0; i < 2; i += 1) {
-    					const child_ctx = get_each_context$4(ctx, each_value, i);
+    					const child_ctx = get_each_context$1(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     						transition_in(each_blocks[i], 1);
     					} else {
-    						each_blocks[i] = create_each_block$4(child_ctx);
+    						each_blocks[i] = create_each_block$1(child_ctx);
     						each_blocks[i].c();
     						transition_in(each_blocks[i], 1);
     						each_blocks[i].m(div1, null);
@@ -5219,11 +5600,11 @@ var app = (function () {
     				check_outros();
     			}
 
-    			if (dirty & /*stacked*/ 4) {
+    			if (!current || dirty & /*stacked*/ 4) {
     				toggle_class(section, "stacked", /*stacked*/ ctx[2]);
     			}
 
-    			if (dirty & /*isLoaded*/ 16) {
+    			if (!current || dirty & /*isLoaded*/ 16) {
     				toggle_class(section, "is-loaded", /*isLoaded*/ ctx[4]);
     			}
     		},
@@ -5256,7 +5637,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$7.name,
+    		id: create_fragment$4.name,
     		type: "component",
     		source: "",
     		ctx
@@ -5265,9 +5646,11 @@ var app = (function () {
     	return block;
     }
 
-    function instance$7($$self, $$props, $$invalidate) {
+    function instance$4($$self, $$props, $$invalidate) {
+    	let focusedClueNumbers;
+    	let currentClue;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Clues", slots, []);
+    	validate_slots('Clues', slots, []);
     	let { clues } = $$props;
     	let { cellIndexMap } = $$props;
     	let { focusedDirection } = $$props;
@@ -5289,32 +5672,66 @@ var app = (function () {
     		onClueFocus({ direction, id });
     	}
 
+    	$$self.$$.on_mount.push(function () {
+    		if (clues === undefined && !('clues' in $$props || $$self.$$.bound[$$self.$$.props['clues']])) {
+    			console.warn("<Clues> was created without expected prop 'clues'");
+    		}
+
+    		if (cellIndexMap === undefined && !('cellIndexMap' in $$props || $$self.$$.bound[$$self.$$.props['cellIndexMap']])) {
+    			console.warn("<Clues> was created without expected prop 'cellIndexMap'");
+    		}
+
+    		if (focusedDirection === undefined && !('focusedDirection' in $$props || $$self.$$.bound[$$self.$$.props['focusedDirection']])) {
+    			console.warn("<Clues> was created without expected prop 'focusedDirection'");
+    		}
+
+    		if (focusedCellIndex === undefined && !('focusedCellIndex' in $$props || $$self.$$.bound[$$self.$$.props['focusedCellIndex']])) {
+    			console.warn("<Clues> was created without expected prop 'focusedCellIndex'");
+    		}
+
+    		if (focusedCell === undefined && !('focusedCell' in $$props || $$self.$$.bound[$$self.$$.props['focusedCell']])) {
+    			console.warn("<Clues> was created without expected prop 'focusedCell'");
+    		}
+
+    		if (stacked === undefined && !('stacked' in $$props || $$self.$$.bound[$$self.$$.props['stacked']])) {
+    			console.warn("<Clues> was created without expected prop 'stacked'");
+    		}
+
+    		if (isDisableHighlight === undefined && !('isDisableHighlight' in $$props || $$self.$$.bound[$$self.$$.props['isDisableHighlight']])) {
+    			console.warn("<Clues> was created without expected prop 'isDisableHighlight'");
+    		}
+
+    		if (isLoaded === undefined && !('isLoaded' in $$props || $$self.$$.bound[$$self.$$.props['isLoaded']])) {
+    			console.warn("<Clues> was created without expected prop 'isLoaded'");
+    		}
+    	});
+
     	const writable_props = [
-    		"clues",
-    		"cellIndexMap",
-    		"focusedDirection",
-    		"focusedCellIndex",
-    		"focusedCell",
-    		"stacked",
-    		"isDisableHighlight",
-    		"isLoaded"
+    		'clues',
+    		'cellIndexMap',
+    		'focusedDirection',
+    		'focusedCellIndex',
+    		'focusedCell',
+    		'stacked',
+    		'isDisableHighlight',
+    		'isLoaded'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Clues> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Clues> was created with unknown prop '${key}'`);
     	});
 
     	const func = (direction, d) => d.direction === direction;
 
     	$$self.$$set = $$props => {
-    		if ("clues" in $$props) $$invalidate(1, clues = $$props.clues);
-    		if ("cellIndexMap" in $$props) $$invalidate(10, cellIndexMap = $$props.cellIndexMap);
-    		if ("focusedDirection" in $$props) $$invalidate(0, focusedDirection = $$props.focusedDirection);
-    		if ("focusedCellIndex" in $$props) $$invalidate(9, focusedCellIndex = $$props.focusedCellIndex);
-    		if ("focusedCell" in $$props) $$invalidate(11, focusedCell = $$props.focusedCell);
-    		if ("stacked" in $$props) $$invalidate(2, stacked = $$props.stacked);
-    		if ("isDisableHighlight" in $$props) $$invalidate(3, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("isLoaded" in $$props) $$invalidate(4, isLoaded = $$props.isLoaded);
+    		if ('clues' in $$props) $$invalidate(1, clues = $$props.clues);
+    		if ('cellIndexMap' in $$props) $$invalidate(10, cellIndexMap = $$props.cellIndexMap);
+    		if ('focusedDirection' in $$props) $$invalidate(0, focusedDirection = $$props.focusedDirection);
+    		if ('focusedCellIndex' in $$props) $$invalidate(9, focusedCellIndex = $$props.focusedCellIndex);
+    		if ('focusedCell' in $$props) $$invalidate(11, focusedCell = $$props.focusedCell);
+    		if ('stacked' in $$props) $$invalidate(2, stacked = $$props.stacked);
+    		if ('isDisableHighlight' in $$props) $$invalidate(3, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('isLoaded' in $$props) $$invalidate(4, isLoaded = $$props.isLoaded);
     	};
 
     	$$self.$capture_state = () => ({
@@ -5335,20 +5752,17 @@ var app = (function () {
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("clues" in $$props) $$invalidate(1, clues = $$props.clues);
-    		if ("cellIndexMap" in $$props) $$invalidate(10, cellIndexMap = $$props.cellIndexMap);
-    		if ("focusedDirection" in $$props) $$invalidate(0, focusedDirection = $$props.focusedDirection);
-    		if ("focusedCellIndex" in $$props) $$invalidate(9, focusedCellIndex = $$props.focusedCellIndex);
-    		if ("focusedCell" in $$props) $$invalidate(11, focusedCell = $$props.focusedCell);
-    		if ("stacked" in $$props) $$invalidate(2, stacked = $$props.stacked);
-    		if ("isDisableHighlight" in $$props) $$invalidate(3, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("isLoaded" in $$props) $$invalidate(4, isLoaded = $$props.isLoaded);
-    		if ("focusedClueNumbers" in $$props) $$invalidate(5, focusedClueNumbers = $$props.focusedClueNumbers);
-    		if ("currentClue" in $$props) $$invalidate(6, currentClue = $$props.currentClue);
+    		if ('clues' in $$props) $$invalidate(1, clues = $$props.clues);
+    		if ('cellIndexMap' in $$props) $$invalidate(10, cellIndexMap = $$props.cellIndexMap);
+    		if ('focusedDirection' in $$props) $$invalidate(0, focusedDirection = $$props.focusedDirection);
+    		if ('focusedCellIndex' in $$props) $$invalidate(9, focusedCellIndex = $$props.focusedCellIndex);
+    		if ('focusedCell' in $$props) $$invalidate(11, focusedCell = $$props.focusedCell);
+    		if ('stacked' in $$props) $$invalidate(2, stacked = $$props.stacked);
+    		if ('isDisableHighlight' in $$props) $$invalidate(3, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('isLoaded' in $$props) $$invalidate(4, isLoaded = $$props.isLoaded);
+    		if ('focusedClueNumbers' in $$props) $$invalidate(5, focusedClueNumbers = $$props.focusedClueNumbers);
+    		if ('currentClue' in $$props) $$invalidate(6, currentClue = $$props.currentClue);
     	};
-
-    	let focusedClueNumbers;
-    	let currentClue;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -5356,11 +5770,11 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty & /*focusedCell*/ 2048) {
-    			 $$invalidate(5, focusedClueNumbers = focusedCell.clueNumbers || {});
+    			$$invalidate(5, focusedClueNumbers = focusedCell.clueNumbers || {});
     		}
 
     		if ($$self.$$.dirty & /*clues, focusedDirection, focusedClueNumbers*/ 35) {
-    			 $$invalidate(6, currentClue = clues.find(c => c.direction === focusedDirection && c.number === focusedClueNumbers[focusedDirection]) || {});
+    			$$invalidate(6, currentClue = clues.find(c => c.direction === focusedDirection && c.number === focusedClueNumbers[focusedDirection]) || {});
     		}
     	};
 
@@ -5385,7 +5799,7 @@ var app = (function () {
     	constructor(options) {
     		super(options);
 
-    		init(this, options, instance$7, create_fragment$7, safe_not_equal, {
+    		init(this, options, instance$4, create_fragment$4, safe_not_equal, {
     			clues: 1,
     			cellIndexMap: 10,
     			focusedDirection: 0,
@@ -5400,43 +5814,8 @@ var app = (function () {
     			component: this,
     			tagName: "Clues",
     			options,
-    			id: create_fragment$7.name
+    			id: create_fragment$4.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*clues*/ ctx[1] === undefined && !("clues" in props)) {
-    			console.warn("<Clues> was created without expected prop 'clues'");
-    		}
-
-    		if (/*cellIndexMap*/ ctx[10] === undefined && !("cellIndexMap" in props)) {
-    			console.warn("<Clues> was created without expected prop 'cellIndexMap'");
-    		}
-
-    		if (/*focusedDirection*/ ctx[0] === undefined && !("focusedDirection" in props)) {
-    			console.warn("<Clues> was created without expected prop 'focusedDirection'");
-    		}
-
-    		if (/*focusedCellIndex*/ ctx[9] === undefined && !("focusedCellIndex" in props)) {
-    			console.warn("<Clues> was created without expected prop 'focusedCellIndex'");
-    		}
-
-    		if (/*focusedCell*/ ctx[11] === undefined && !("focusedCell" in props)) {
-    			console.warn("<Clues> was created without expected prop 'focusedCell'");
-    		}
-
-    		if (/*stacked*/ ctx[2] === undefined && !("stacked" in props)) {
-    			console.warn("<Clues> was created without expected prop 'stacked'");
-    		}
-
-    		if (/*isDisableHighlight*/ ctx[3] === undefined && !("isDisableHighlight" in props)) {
-    			console.warn("<Clues> was created without expected prop 'isDisableHighlight'");
-    		}
-
-    		if (/*isLoaded*/ ctx[4] === undefined && !("isLoaded" in props)) {
-    			console.warn("<Clues> was created without expected prop 'isLoaded'");
-    		}
     	}
 
     	get clues() {
@@ -5508,7 +5887,7 @@ var app = (function () {
         return t * t;
     }
 
-    function fade(node, { delay = 0, duration = 400, easing = identity }) {
+    function fade(node, { delay = 0, duration = 400, easing = identity } = {}) {
         const o = +getComputedStyle(node).opacity;
         return {
             delay,
@@ -5518,10 +5897,10 @@ var app = (function () {
         };
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Confetti.svelte generated by Svelte v3.29.0 */
-    const file$8 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Confetti.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Confetti.svelte generated by Svelte v3.59.2 */
+    const file$3 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Confetti.svelte";
 
-    function get_each_context$5(ctx, list, i) {
+    function get_each_context(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[8] = list[i][0];
     	child_ctx[9] = list[i][1];
@@ -5531,11 +5910,10 @@ var app = (function () {
     }
 
     // (45:2) {#each allElements as [element, color, scale], i}
-    function create_each_block$5(ctx) {
+    function create_each_block(ctx) {
     	let g1;
     	let g0;
     	let raw_value = /*element*/ ctx[8] + "";
-    	let g0_fill_value;
     	let g0_style_value;
 
     	const block = {
@@ -5545,32 +5923,32 @@ var app = (function () {
     			this.h();
     		},
     		l: function claim(nodes) {
-    			g1 = claim_element(nodes, "g", { style: true, class: true }, 1);
+    			g1 = claim_svg_element(nodes, "g", { style: true, class: true });
     			var g1_nodes = children(g1);
-    			g0 = claim_element(g1_nodes, "g", { fill: true, style: true, class: true }, 1);
+    			g0 = claim_svg_element(g1_nodes, "g", { fill: true, style: true, class: true });
     			var g0_nodes = children(g0);
     			g0_nodes.forEach(detach_dev);
     			g1_nodes.forEach(detach_dev);
     			this.h();
     		},
     		h: function hydrate() {
-    			attr_dev(g0, "fill", g0_fill_value = /*color*/ ctx[9]);
+    			attr_dev(g0, "fill", /*color*/ ctx[9]);
 
     			attr_dev(g0, "style", g0_style_value = [
     				`--rotation: ${Math.random() * 360}deg`,
     				`animation-delay: ${quadIn(/*i*/ ctx[12] / /*numberOfElements*/ ctx[0])}s`,
     				`animation-duration: ${/*durationInSeconds*/ ctx[1] * /*randomNumber*/ ctx[2](0.7, 1)}s`
-    			].join(";"));
+    			].join(';'));
 
     			attr_dev(g0, "class", "svelte-15wt7c8");
-    			add_location(g0, file$8, 46, 6, 2525);
+    			add_location(g0, file$3, 46, 6, 2525);
     			set_style(g1, "transform", "scale(" + /*scale*/ ctx[10] + ")");
     			attr_dev(g1, "class", "svelte-15wt7c8");
-    			add_location(g1, file$8, 45, 4, 2481);
+    			add_location(g1, file$3, 45, 4, 2481);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, g1, anchor);
-    			append_dev(g1, g0);
+    			insert_hydration_dev(target, g1, anchor);
+    			append_hydration_dev(g1, g0);
     			g0.innerHTML = raw_value;
     		},
     		p: function update(ctx, dirty) {
@@ -5578,7 +5956,7 @@ var app = (function () {
     				`--rotation: ${Math.random() * 360}deg`,
     				`animation-delay: ${quadIn(/*i*/ ctx[12] / /*numberOfElements*/ ctx[0])}s`,
     				`animation-duration: ${/*durationInSeconds*/ ctx[1] * /*randomNumber*/ ctx[2](0.7, 1)}s`
-    			].join(";"))) {
+    			].join(';'))) {
     				attr_dev(g0, "style", g0_style_value);
     			}
     		},
@@ -5589,7 +5967,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_each_block$5.name,
+    		id: create_each_block.name,
     		type: "each",
     		source: "(45:2) {#each allElements as [element, color, scale], i}",
     		ctx
@@ -5598,14 +5976,14 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$8(ctx) {
+    function create_fragment$3(ctx) {
     	let svg;
     	let each_value = /*allElements*/ ctx[3];
     	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$5(get_each_context$5(ctx, each_value, i));
+    		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
     	}
 
     	const block = {
@@ -5619,7 +5997,7 @@ var app = (function () {
     			this.h();
     		},
     		l: function claim(nodes) {
-    			svg = claim_element(nodes, "svg", { class: true, viewBox: true }, 1);
+    			svg = claim_svg_element(nodes, "svg", { class: true, viewBox: true });
     			var svg_nodes = children(svg);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
@@ -5632,13 +6010,15 @@ var app = (function () {
     		h: function hydrate() {
     			attr_dev(svg, "class", "confetti svelte-15wt7c8");
     			attr_dev(svg, "viewBox", "-10 -10 10 10");
-    			add_location(svg, file$8, 43, 0, 2378);
+    			add_location(svg, file$3, 43, 0, 2378);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, svg, anchor);
+    			insert_hydration_dev(target, svg, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(svg, null);
+    				if (each_blocks[i]) {
+    					each_blocks[i].m(svg, null);
+    				}
     			}
     		},
     		p: function update(ctx, [dirty]) {
@@ -5648,12 +6028,12 @@ var app = (function () {
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$5(ctx, each_value, i);
+    					const child_ctx = get_each_context(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     					} else {
-    						each_blocks[i] = create_each_block$5(child_ctx);
+    						each_blocks[i] = create_each_block(child_ctx);
     						each_blocks[i].c();
     						each_blocks[i].m(svg, null);
     					}
@@ -5676,7 +6056,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$8.name,
+    		id: create_fragment$3.name,
     		type: "component",
     		source: "",
     		ctx
@@ -5685,9 +6065,9 @@ var app = (function () {
     	return block;
     }
 
-    function instance$8($$self, $$props, $$invalidate) {
+    function instance$3($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Confetti", slots, []);
+    	validate_slots('Confetti', slots, []);
     	let { numberOfElements = 50 } = $$props;
     	let { durationInSeconds = 2 } = $$props;
 
@@ -5719,16 +6099,16 @@ var app = (function () {
     	];
 
     	const allElements = new Array(numberOfElements).fill(0).map((_, i) => [pickFrom(elementOptions), pickFrom(colors), Math.random()]);
-    	const writable_props = ["numberOfElements", "durationInSeconds", "colors"];
+    	const writable_props = ['numberOfElements', 'durationInSeconds', 'colors'];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Confetti> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Confetti> was created with unknown prop '${key}'`);
     	});
 
     	$$self.$$set = $$props => {
-    		if ("numberOfElements" in $$props) $$invalidate(0, numberOfElements = $$props.numberOfElements);
-    		if ("durationInSeconds" in $$props) $$invalidate(1, durationInSeconds = $$props.durationInSeconds);
-    		if ("colors" in $$props) $$invalidate(4, colors = $$props.colors);
+    		if ('numberOfElements' in $$props) $$invalidate(0, numberOfElements = $$props.numberOfElements);
+    		if ('durationInSeconds' in $$props) $$invalidate(1, durationInSeconds = $$props.durationInSeconds);
+    		if ('colors' in $$props) $$invalidate(4, colors = $$props.colors);
     	};
 
     	$$self.$capture_state = () => ({
@@ -5744,9 +6124,9 @@ var app = (function () {
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("numberOfElements" in $$props) $$invalidate(0, numberOfElements = $$props.numberOfElements);
-    		if ("durationInSeconds" in $$props) $$invalidate(1, durationInSeconds = $$props.durationInSeconds);
-    		if ("colors" in $$props) $$invalidate(4, colors = $$props.colors);
+    		if ('numberOfElements' in $$props) $$invalidate(0, numberOfElements = $$props.numberOfElements);
+    		if ('durationInSeconds' in $$props) $$invalidate(1, durationInSeconds = $$props.durationInSeconds);
+    		if ('colors' in $$props) $$invalidate(4, colors = $$props.colors);
     	};
 
     	if ($$props && "$$inject" in $$props) {
@@ -5760,7 +6140,7 @@ var app = (function () {
     	constructor(options) {
     		super(options);
 
-    		init(this, options, instance$8, create_fragment$8, safe_not_equal, {
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {
     			numberOfElements: 0,
     			durationInSeconds: 1,
     			colors: 4
@@ -5770,7 +6150,7 @@ var app = (function () {
     			component: this,
     			tagName: "Confetti",
     			options,
-    			id: create_fragment$8.name
+    			id: create_fragment$3.name
     		});
     	}
 
@@ -5799,11 +6179,11 @@ var app = (function () {
     	}
     }
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/CompletedMessage.svelte generated by Svelte v3.29.0 */
-    const file$9 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/CompletedMessage.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/CompletedMessage.svelte generated by Svelte v3.59.2 */
+    const file$2 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/CompletedMessage.svelte";
 
     // (10:0) {#if isOpen}
-    function create_if_block$4(ctx) {
+    function create_if_block$1(ctx) {
     	let div2;
     	let div1;
     	let div0;
@@ -5820,7 +6200,7 @@ var app = (function () {
     	let dispose;
     	const default_slot_template = /*#slots*/ ctx[3].default;
     	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[2], null);
-    	let if_block = /*showConfetti*/ ctx[0] && create_if_block_1$2(ctx);
+    	let if_block = /*showConfetti*/ ctx[0] && create_if_block_1$1(ctx);
 
     	const block = {
     		c: function create() {
@@ -5862,38 +6242,38 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div0, "class", "message svelte-hm3hg2");
-    			add_location(div0, file$9, 12, 6, 266);
+    			add_location(div0, file$2, 12, 6, 266);
     			attr_dev(button, "class", "svelte-hm3hg2");
-    			add_location(button, file$9, 16, 6, 325);
+    			add_location(button, file$2, 16, 6, 325);
     			attr_dev(div1, "class", "content svelte-hm3hg2");
-    			add_location(div1, file$9, 11, 4, 238);
+    			add_location(div1, file$2, 11, 4, 238);
     			attr_dev(div2, "class", "completed svelte-hm3hg2");
-    			add_location(div2, file$9, 10, 2, 180);
+    			add_location(div2, file$2, 10, 2, 180);
     			attr_dev(div3, "class", "curtain svelte-hm3hg2");
-    			add_location(div3, file$9, 25, 2, 509);
+    			add_location(div3, file$2, 25, 2, 509);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div2, anchor);
-    			append_dev(div2, div1);
-    			append_dev(div1, div0);
+    			insert_hydration_dev(target, div2, anchor);
+    			append_hydration_dev(div2, div1);
+    			append_hydration_dev(div1, div0);
 
     			if (default_slot) {
     				default_slot.m(div0, null);
     			}
 
-    			append_dev(div1, t0);
-    			append_dev(div1, button);
-    			append_dev(button, t1);
-    			append_dev(div2, t2);
+    			append_hydration_dev(div1, t0);
+    			append_hydration_dev(div1, button);
+    			append_hydration_dev(button, t1);
+    			append_hydration_dev(div2, t2);
     			if (if_block) if_block.m(div2, null);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, div3, anchor);
+    			insert_hydration_dev(target, t3, anchor);
+    			insert_hydration_dev(target, div3, anchor);
     			current = true;
 
     			if (!mounted) {
     				dispose = [
-    					listen_dev(button, "click", /*click_handler*/ ctx[4], false, false, false),
-    					listen_dev(div3, "click", /*click_handler_1*/ ctx[5], false, false, false)
+    					listen_dev(button, "click", /*click_handler*/ ctx[4], false, false, false, false),
+    					listen_dev(div3, "click", /*click_handler_1*/ ctx[5], false, false, false, false)
     				];
 
     				mounted = true;
@@ -5901,8 +6281,17 @@ var app = (function () {
     		},
     		p: function update(ctx, dirty) {
     			if (default_slot) {
-    				if (default_slot.p && dirty & /*$$scope*/ 4) {
-    					update_slot(default_slot, default_slot_template, ctx, /*$$scope*/ ctx[2], dirty, null, null);
+    				if (default_slot.p && (!current || dirty & /*$$scope*/ 4)) {
+    					update_slot_base(
+    						default_slot,
+    						default_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[2],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[2])
+    						: get_slot_changes(default_slot_template, /*$$scope*/ ctx[2], dirty, null),
+    						null
+    					);
     				}
     			}
 
@@ -5912,7 +6301,7 @@ var app = (function () {
     						transition_in(if_block, 1);
     					}
     				} else {
-    					if_block = create_if_block_1$2(ctx);
+    					if_block = create_if_block_1$1(ctx);
     					if_block.c();
     					transition_in(if_block, 1);
     					if_block.m(div2, null);
@@ -5933,11 +6322,13 @@ var app = (function () {
     			transition_in(if_block);
 
     			add_render_callback(() => {
+    				if (!current) return;
     				if (!div2_transition) div2_transition = create_bidirectional_transition(div2, fade, { y: 20 }, true);
     				div2_transition.run(1);
     			});
 
     			add_render_callback(() => {
+    				if (!current) return;
     				if (!div3_transition) div3_transition = create_bidirectional_transition(div3, fade, { duration: 250 }, true);
     				div3_transition.run(1);
     			});
@@ -5968,7 +6359,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block$4.name,
+    		id: create_if_block$1.name,
     		type: "if",
     		source: "(10:0) {#if isOpen}",
     		ctx
@@ -5978,7 +6369,7 @@ var app = (function () {
     }
 
     // (20:4) {#if showConfetti}
-    function create_if_block_1$2(ctx) {
+    function create_if_block_1$1(ctx) {
     	let div;
     	let confetti;
     	let current;
@@ -5999,10 +6390,10 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div, "class", "confetti svelte-hm3hg2");
-    			add_location(div, file$9, 20, 6, 431);
+    			add_location(div, file$2, 20, 6, 431);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
+    			insert_hydration_dev(target, div, anchor);
     			mount_component(confetti, div, null);
     			current = true;
     		},
@@ -6023,7 +6414,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_1$2.name,
+    		id: create_if_block_1$1.name,
     		type: "if",
     		source: "(20:4) {#if showConfetti}",
     		ctx
@@ -6032,10 +6423,10 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$9(ctx) {
+    function create_fragment$2(ctx) {
     	let if_block_anchor;
     	let current;
-    	let if_block = /*isOpen*/ ctx[1] && create_if_block$4(ctx);
+    	let if_block = /*isOpen*/ ctx[1] && create_if_block$1(ctx);
 
     	const block = {
     		c: function create() {
@@ -6048,7 +6439,7 @@ var app = (function () {
     		},
     		m: function mount(target, anchor) {
     			if (if_block) if_block.m(target, anchor);
-    			insert_dev(target, if_block_anchor, anchor);
+    			insert_hydration_dev(target, if_block_anchor, anchor);
     			current = true;
     		},
     		p: function update(ctx, [dirty]) {
@@ -6060,7 +6451,7 @@ var app = (function () {
     						transition_in(if_block, 1);
     					}
     				} else {
-    					if_block = create_if_block$4(ctx);
+    					if_block = create_if_block$1(ctx);
     					if_block.c();
     					transition_in(if_block, 1);
     					if_block.m(if_block_anchor.parentNode, if_block_anchor);
@@ -6092,7 +6483,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$9.name,
+    		id: create_fragment$2.name,
     		type: "component",
     		source: "",
     		ctx
@@ -6101,30 +6492,30 @@ var app = (function () {
     	return block;
     }
 
-    function instance$9($$self, $$props, $$invalidate) {
+    function instance$2($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("CompletedMessage", slots, ['default']);
+    	validate_slots('CompletedMessage', slots, ['default']);
     	let { showConfetti = true } = $$props;
     	let isOpen = true;
-    	const writable_props = ["showConfetti"];
+    	const writable_props = ['showConfetti'];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<CompletedMessage> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<CompletedMessage> was created with unknown prop '${key}'`);
     	});
 
     	const click_handler = () => $$invalidate(1, isOpen = false);
     	const click_handler_1 = () => $$invalidate(1, isOpen = false);
 
     	$$self.$$set = $$props => {
-    		if ("showConfetti" in $$props) $$invalidate(0, showConfetti = $$props.showConfetti);
-    		if ("$$scope" in $$props) $$invalidate(2, $$scope = $$props.$$scope);
+    		if ('showConfetti' in $$props) $$invalidate(0, showConfetti = $$props.showConfetti);
+    		if ('$$scope' in $$props) $$invalidate(2, $$scope = $$props.$$scope);
     	};
 
     	$$self.$capture_state = () => ({ fade, Confetti, showConfetti, isOpen });
 
     	$$self.$inject_state = $$props => {
-    		if ("showConfetti" in $$props) $$invalidate(0, showConfetti = $$props.showConfetti);
-    		if ("isOpen" in $$props) $$invalidate(1, isOpen = $$props.isOpen);
+    		if ('showConfetti' in $$props) $$invalidate(0, showConfetti = $$props.showConfetti);
+    		if ('isOpen' in $$props) $$invalidate(1, isOpen = $$props.isOpen);
     	};
 
     	if ($$props && "$$inject" in $$props) {
@@ -6137,13 +6528,13 @@ var app = (function () {
     class CompletedMessage extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$9, create_fragment$9, safe_not_equal, { showConfetti: 0 });
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { showConfetti: 0 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "CompletedMessage",
     			options,
-    			id: create_fragment$9.name
+    			id: create_fragment$2.name
     		});
     	}
 
@@ -6364,8 +6755,8 @@ var app = (function () {
     		.join(";");
     });
 
-    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Crossword.svelte generated by Svelte v3.29.0 */
-    const file$a = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Crossword.svelte";
+    /* Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Crossword.svelte generated by Svelte v3.59.2 */
+    const file$1 = "Users/BRUSSBD/Documents/GitHub/svelte-crossword/src/Crossword.svelte";
     const get_message_slot_changes = dirty => ({});
     const get_message_slot_context = ctx => ({});
     const get_toolbar_slot_changes = dirty => ({});
@@ -6377,7 +6768,7 @@ var app = (function () {
     });
 
     // (130:0) {#if validated}
-    function create_if_block$5(ctx) {
+    function create_if_block(ctx) {
     	let article;
     	let t0;
     	let div;
@@ -6393,89 +6784,89 @@ var app = (function () {
     	let t2;
     	let article_resize_listener;
     	let current;
-    	const toolbar_slot_template = /*#slots*/ ctx[30].toolbar;
-    	const toolbar_slot = create_slot(toolbar_slot_template, ctx, /*$$scope*/ ctx[38], get_toolbar_slot_context);
+    	const toolbar_slot_template = /*#slots*/ ctx[31].toolbar;
+    	const toolbar_slot = create_slot(toolbar_slot_template, ctx, /*$$scope*/ ctx[39], get_toolbar_slot_context);
     	const toolbar_slot_or_fallback = toolbar_slot || fallback_block_1(ctx);
 
     	function clues_1_focusedCellIndex_binding(value) {
-    		/*clues_1_focusedCellIndex_binding*/ ctx[31].call(null, value);
+    		/*clues_1_focusedCellIndex_binding*/ ctx[32](value);
     	}
 
     	function clues_1_focusedCell_binding(value) {
-    		/*clues_1_focusedCell_binding*/ ctx[32].call(null, value);
+    		/*clues_1_focusedCell_binding*/ ctx[33](value);
     	}
 
     	function clues_1_focusedDirection_binding(value) {
-    		/*clues_1_focusedDirection_binding*/ ctx[33].call(null, value);
+    		/*clues_1_focusedDirection_binding*/ ctx[34](value);
     	}
 
     	let clues_1_props = {
-    		clues: /*clues*/ ctx[13],
-    		cellIndexMap: /*cellIndexMap*/ ctx[16],
-    		stacked: /*stacked*/ ctx[19],
+    		clues: /*clues*/ ctx[8],
+    		cellIndexMap: /*cellIndexMap*/ ctx[19],
+    		stacked: /*stacked*/ ctx[17],
     		isDisableHighlight: /*isDisableHighlight*/ ctx[18],
-    		isLoaded: /*isLoaded*/ ctx[10]
+    		isLoaded: /*isLoaded*/ ctx[13]
     	};
 
-    	if (/*focusedCellIndex*/ ctx[8] !== void 0) {
-    		clues_1_props.focusedCellIndex = /*focusedCellIndex*/ ctx[8];
+    	if (/*focusedCellIndex*/ ctx[7] !== void 0) {
+    		clues_1_props.focusedCellIndex = /*focusedCellIndex*/ ctx[7];
     	}
 
-    	if (/*focusedCell*/ ctx[15] !== void 0) {
-    		clues_1_props.focusedCell = /*focusedCell*/ ctx[15];
+    	if (/*focusedCell*/ ctx[20] !== void 0) {
+    		clues_1_props.focusedCell = /*focusedCell*/ ctx[20];
     	}
 
-    	if (/*focusedDirection*/ ctx[7] !== void 0) {
-    		clues_1_props.focusedDirection = /*focusedDirection*/ ctx[7];
+    	if (/*focusedDirection*/ ctx[11] !== void 0) {
+    		clues_1_props.focusedDirection = /*focusedDirection*/ ctx[11];
     	}
 
     	clues_1 = new Clues({ props: clues_1_props, $$inline: true });
-    	binding_callbacks.push(() => bind(clues_1, "focusedCellIndex", clues_1_focusedCellIndex_binding));
-    	binding_callbacks.push(() => bind(clues_1, "focusedCell", clues_1_focusedCell_binding));
-    	binding_callbacks.push(() => bind(clues_1, "focusedDirection", clues_1_focusedDirection_binding));
+    	binding_callbacks.push(() => bind(clues_1, 'focusedCellIndex', clues_1_focusedCellIndex_binding));
+    	binding_callbacks.push(() => bind(clues_1, 'focusedCell', clues_1_focusedCell_binding));
+    	binding_callbacks.push(() => bind(clues_1, 'focusedDirection', clues_1_focusedDirection_binding));
 
     	function puzzle_cells_binding(value) {
-    		/*puzzle_cells_binding*/ ctx[34].call(null, value);
+    		/*puzzle_cells_binding*/ ctx[35](value);
     	}
 
     	function puzzle_focusedCellIndex_binding(value) {
-    		/*puzzle_focusedCellIndex_binding*/ ctx[35].call(null, value);
+    		/*puzzle_focusedCellIndex_binding*/ ctx[36](value);
     	}
 
     	function puzzle_focusedDirection_binding(value) {
-    		/*puzzle_focusedDirection_binding*/ ctx[36].call(null, value);
+    		/*puzzle_focusedDirection_binding*/ ctx[37](value);
     	}
 
     	let puzzle_props = {
-    		clues: /*clues*/ ctx[13],
-    		focusedCell: /*focusedCell*/ ctx[15],
-    		isRevealing: /*isRevealing*/ ctx[9],
-    		isChecking: /*isChecking*/ ctx[11],
+    		clues: /*clues*/ ctx[8],
+    		focusedCell: /*focusedCell*/ ctx[20],
+    		isRevealing: /*isRevealing*/ ctx[12],
+    		isChecking: /*isChecking*/ ctx[14],
     		isDisableHighlight: /*isDisableHighlight*/ ctx[18],
     		revealDuration: /*revealDuration*/ ctx[1],
     		showKeyboard: /*showKeyboard*/ ctx[4],
-    		stacked: /*stacked*/ ctx[19],
-    		isLoaded: /*isLoaded*/ ctx[10],
+    		stacked: /*stacked*/ ctx[17],
+    		isLoaded: /*isLoaded*/ ctx[13],
     		keyboardStyle: /*keyboardStyle*/ ctx[5]
     	};
 
-    	if (/*cells*/ ctx[14] !== void 0) {
-    		puzzle_props.cells = /*cells*/ ctx[14];
+    	if (/*cells*/ ctx[9] !== void 0) {
+    		puzzle_props.cells = /*cells*/ ctx[9];
     	}
 
-    	if (/*focusedCellIndex*/ ctx[8] !== void 0) {
-    		puzzle_props.focusedCellIndex = /*focusedCellIndex*/ ctx[8];
+    	if (/*focusedCellIndex*/ ctx[7] !== void 0) {
+    		puzzle_props.focusedCellIndex = /*focusedCellIndex*/ ctx[7];
     	}
 
-    	if (/*focusedDirection*/ ctx[7] !== void 0) {
-    		puzzle_props.focusedDirection = /*focusedDirection*/ ctx[7];
+    	if (/*focusedDirection*/ ctx[11] !== void 0) {
+    		puzzle_props.focusedDirection = /*focusedDirection*/ ctx[11];
     	}
 
     	puzzle = new Puzzle({ props: puzzle_props, $$inline: true });
-    	binding_callbacks.push(() => bind(puzzle, "cells", puzzle_cells_binding));
-    	binding_callbacks.push(() => bind(puzzle, "focusedCellIndex", puzzle_focusedCellIndex_binding));
-    	binding_callbacks.push(() => bind(puzzle, "focusedDirection", puzzle_focusedDirection_binding));
-    	let if_block = /*isComplete*/ ctx[17] && !/*isRevealing*/ ctx[9] && /*showCompleteMessage*/ ctx[2] && create_if_block_1$3(ctx);
+    	binding_callbacks.push(() => bind(puzzle, 'cells', puzzle_cells_binding));
+    	binding_callbacks.push(() => bind(puzzle, 'focusedCellIndex', puzzle_focusedCellIndex_binding));
+    	binding_callbacks.push(() => bind(puzzle, 'focusedDirection', puzzle_focusedDirection_binding));
+    	let if_block = /*isComplete*/ ctx[10] && !/*isRevealing*/ ctx[12] && /*showCompleteMessage*/ ctx[2] && create_if_block_1(ctx);
 
     	const block = {
     		c: function create() {
@@ -6508,117 +6899,126 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(div, "class", "play svelte-186p9qm");
-    			toggle_class(div, "stacked", /*stacked*/ ctx[19]);
-    			toggle_class(div, "is-loaded", /*isLoaded*/ ctx[10]);
-    			add_location(div, file$a, 142, 4, 3821);
+    			toggle_class(div, "stacked", /*stacked*/ ctx[17]);
+    			toggle_class(div, "is-loaded", /*isLoaded*/ ctx[13]);
+    			add_location(div, file$1, 142, 4, 3821);
     			attr_dev(article, "class", "svelte-crossword svelte-186p9qm");
-    			attr_dev(article, "style", /*inlineStyles*/ ctx[20]);
-    			add_render_callback(() => /*article_elementresize_handler*/ ctx[37].call(article));
-    			add_location(article, file$a, 130, 2, 3529);
+    			attr_dev(article, "style", /*inlineStyles*/ ctx[16]);
+    			add_render_callback(() => /*article_elementresize_handler*/ ctx[38].call(article));
+    			add_location(article, file$1, 130, 2, 3529);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, article, anchor);
+    			insert_hydration_dev(target, article, anchor);
 
     			if (toolbar_slot_or_fallback) {
     				toolbar_slot_or_fallback.m(article, null);
     			}
 
-    			append_dev(article, t0);
-    			append_dev(article, div);
+    			append_hydration_dev(article, t0);
+    			append_hydration_dev(article, div);
     			mount_component(clues_1, div, null);
-    			append_dev(div, t1);
+    			append_hydration_dev(div, t1);
     			mount_component(puzzle, div, null);
-    			append_dev(article, t2);
+    			append_hydration_dev(article, t2);
     			if (if_block) if_block.m(article, null);
-    			article_resize_listener = add_resize_listener(article, /*article_elementresize_handler*/ ctx[37].bind(article));
+    			article_resize_listener = add_iframe_resize_listener(article, /*article_elementresize_handler*/ ctx[38].bind(article));
     			current = true;
     		},
     		p: function update(ctx, dirty) {
     			if (toolbar_slot) {
-    				if (toolbar_slot.p && dirty[1] & /*$$scope*/ 128) {
-    					update_slot(toolbar_slot, toolbar_slot_template, ctx, /*$$scope*/ ctx[38], dirty, get_toolbar_slot_changes, get_toolbar_slot_context);
+    				if (toolbar_slot.p && (!current || dirty[1] & /*$$scope*/ 256)) {
+    					update_slot_base(
+    						toolbar_slot,
+    						toolbar_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[39],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[39])
+    						: get_slot_changes(toolbar_slot_template, /*$$scope*/ ctx[39], dirty, get_toolbar_slot_changes),
+    						get_toolbar_slot_context
+    					);
     				}
     			} else {
-    				if (toolbar_slot_or_fallback && toolbar_slot_or_fallback.p && dirty[0] & /*actions*/ 1) {
-    					toolbar_slot_or_fallback.p(ctx, dirty);
+    				if (toolbar_slot_or_fallback && toolbar_slot_or_fallback.p && (!current || dirty[0] & /*actions*/ 1)) {
+    					toolbar_slot_or_fallback.p(ctx, !current ? [-1, -1] : dirty);
     				}
     			}
 
     			const clues_1_changes = {};
-    			if (dirty[0] & /*clues*/ 8192) clues_1_changes.clues = /*clues*/ ctx[13];
-    			if (dirty[0] & /*cellIndexMap*/ 65536) clues_1_changes.cellIndexMap = /*cellIndexMap*/ ctx[16];
-    			if (dirty[0] & /*stacked*/ 524288) clues_1_changes.stacked = /*stacked*/ ctx[19];
+    			if (dirty[0] & /*clues*/ 256) clues_1_changes.clues = /*clues*/ ctx[8];
+    			if (dirty[0] & /*cellIndexMap*/ 524288) clues_1_changes.cellIndexMap = /*cellIndexMap*/ ctx[19];
+    			if (dirty[0] & /*stacked*/ 131072) clues_1_changes.stacked = /*stacked*/ ctx[17];
     			if (dirty[0] & /*isDisableHighlight*/ 262144) clues_1_changes.isDisableHighlight = /*isDisableHighlight*/ ctx[18];
-    			if (dirty[0] & /*isLoaded*/ 1024) clues_1_changes.isLoaded = /*isLoaded*/ ctx[10];
+    			if (dirty[0] & /*isLoaded*/ 8192) clues_1_changes.isLoaded = /*isLoaded*/ ctx[13];
 
-    			if (!updating_focusedCellIndex && dirty[0] & /*focusedCellIndex*/ 256) {
+    			if (!updating_focusedCellIndex && dirty[0] & /*focusedCellIndex*/ 128) {
     				updating_focusedCellIndex = true;
-    				clues_1_changes.focusedCellIndex = /*focusedCellIndex*/ ctx[8];
+    				clues_1_changes.focusedCellIndex = /*focusedCellIndex*/ ctx[7];
     				add_flush_callback(() => updating_focusedCellIndex = false);
     			}
 
-    			if (!updating_focusedCell && dirty[0] & /*focusedCell*/ 32768) {
+    			if (!updating_focusedCell && dirty[0] & /*focusedCell*/ 1048576) {
     				updating_focusedCell = true;
-    				clues_1_changes.focusedCell = /*focusedCell*/ ctx[15];
+    				clues_1_changes.focusedCell = /*focusedCell*/ ctx[20];
     				add_flush_callback(() => updating_focusedCell = false);
     			}
 
-    			if (!updating_focusedDirection && dirty[0] & /*focusedDirection*/ 128) {
+    			if (!updating_focusedDirection && dirty[0] & /*focusedDirection*/ 2048) {
     				updating_focusedDirection = true;
-    				clues_1_changes.focusedDirection = /*focusedDirection*/ ctx[7];
+    				clues_1_changes.focusedDirection = /*focusedDirection*/ ctx[11];
     				add_flush_callback(() => updating_focusedDirection = false);
     			}
 
     			clues_1.$set(clues_1_changes);
     			const puzzle_changes = {};
-    			if (dirty[0] & /*clues*/ 8192) puzzle_changes.clues = /*clues*/ ctx[13];
-    			if (dirty[0] & /*focusedCell*/ 32768) puzzle_changes.focusedCell = /*focusedCell*/ ctx[15];
-    			if (dirty[0] & /*isRevealing*/ 512) puzzle_changes.isRevealing = /*isRevealing*/ ctx[9];
-    			if (dirty[0] & /*isChecking*/ 2048) puzzle_changes.isChecking = /*isChecking*/ ctx[11];
+    			if (dirty[0] & /*clues*/ 256) puzzle_changes.clues = /*clues*/ ctx[8];
+    			if (dirty[0] & /*focusedCell*/ 1048576) puzzle_changes.focusedCell = /*focusedCell*/ ctx[20];
+    			if (dirty[0] & /*isRevealing*/ 4096) puzzle_changes.isRevealing = /*isRevealing*/ ctx[12];
+    			if (dirty[0] & /*isChecking*/ 16384) puzzle_changes.isChecking = /*isChecking*/ ctx[14];
     			if (dirty[0] & /*isDisableHighlight*/ 262144) puzzle_changes.isDisableHighlight = /*isDisableHighlight*/ ctx[18];
     			if (dirty[0] & /*revealDuration*/ 2) puzzle_changes.revealDuration = /*revealDuration*/ ctx[1];
     			if (dirty[0] & /*showKeyboard*/ 16) puzzle_changes.showKeyboard = /*showKeyboard*/ ctx[4];
-    			if (dirty[0] & /*stacked*/ 524288) puzzle_changes.stacked = /*stacked*/ ctx[19];
-    			if (dirty[0] & /*isLoaded*/ 1024) puzzle_changes.isLoaded = /*isLoaded*/ ctx[10];
+    			if (dirty[0] & /*stacked*/ 131072) puzzle_changes.stacked = /*stacked*/ ctx[17];
+    			if (dirty[0] & /*isLoaded*/ 8192) puzzle_changes.isLoaded = /*isLoaded*/ ctx[13];
     			if (dirty[0] & /*keyboardStyle*/ 32) puzzle_changes.keyboardStyle = /*keyboardStyle*/ ctx[5];
 
-    			if (!updating_cells && dirty[0] & /*cells*/ 16384) {
+    			if (!updating_cells && dirty[0] & /*cells*/ 512) {
     				updating_cells = true;
-    				puzzle_changes.cells = /*cells*/ ctx[14];
+    				puzzle_changes.cells = /*cells*/ ctx[9];
     				add_flush_callback(() => updating_cells = false);
     			}
 
-    			if (!updating_focusedCellIndex_1 && dirty[0] & /*focusedCellIndex*/ 256) {
+    			if (!updating_focusedCellIndex_1 && dirty[0] & /*focusedCellIndex*/ 128) {
     				updating_focusedCellIndex_1 = true;
-    				puzzle_changes.focusedCellIndex = /*focusedCellIndex*/ ctx[8];
+    				puzzle_changes.focusedCellIndex = /*focusedCellIndex*/ ctx[7];
     				add_flush_callback(() => updating_focusedCellIndex_1 = false);
     			}
 
-    			if (!updating_focusedDirection_1 && dirty[0] & /*focusedDirection*/ 128) {
+    			if (!updating_focusedDirection_1 && dirty[0] & /*focusedDirection*/ 2048) {
     				updating_focusedDirection_1 = true;
-    				puzzle_changes.focusedDirection = /*focusedDirection*/ ctx[7];
+    				puzzle_changes.focusedDirection = /*focusedDirection*/ ctx[11];
     				add_flush_callback(() => updating_focusedDirection_1 = false);
     			}
 
     			puzzle.$set(puzzle_changes);
 
-    			if (dirty[0] & /*stacked*/ 524288) {
-    				toggle_class(div, "stacked", /*stacked*/ ctx[19]);
+    			if (!current || dirty[0] & /*stacked*/ 131072) {
+    				toggle_class(div, "stacked", /*stacked*/ ctx[17]);
     			}
 
-    			if (dirty[0] & /*isLoaded*/ 1024) {
-    				toggle_class(div, "is-loaded", /*isLoaded*/ ctx[10]);
+    			if (!current || dirty[0] & /*isLoaded*/ 8192) {
+    				toggle_class(div, "is-loaded", /*isLoaded*/ ctx[13]);
     			}
 
-    			if (/*isComplete*/ ctx[17] && !/*isRevealing*/ ctx[9] && /*showCompleteMessage*/ ctx[2]) {
+    			if (/*isComplete*/ ctx[10] && !/*isRevealing*/ ctx[12] && /*showCompleteMessage*/ ctx[2]) {
     				if (if_block) {
     					if_block.p(ctx, dirty);
 
-    					if (dirty[0] & /*isComplete, isRevealing, showCompleteMessage*/ 131588) {
+    					if (dirty[0] & /*isComplete, isRevealing, showCompleteMessage*/ 5124) {
     						transition_in(if_block, 1);
     					}
     				} else {
-    					if_block = create_if_block_1$3(ctx);
+    					if_block = create_if_block_1(ctx);
     					if_block.c();
     					transition_in(if_block, 1);
     					if_block.m(article, null);
@@ -6633,8 +7033,8 @@ var app = (function () {
     				check_outros();
     			}
 
-    			if (!current || dirty[0] & /*inlineStyles*/ 1048576) {
-    				attr_dev(article, "style", /*inlineStyles*/ ctx[20]);
+    			if (!current || dirty[0] & /*inlineStyles*/ 65536) {
+    				attr_dev(article, "style", /*inlineStyles*/ ctx[16]);
     			}
     		},
     		i: function intro(local) {
@@ -6664,7 +7064,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block$5.name,
+    		id: create_if_block.name,
     		type: "if",
     		source: "(130:0) {#if validated}",
     		ctx
@@ -6727,7 +7127,7 @@ var app = (function () {
     }
 
     // (169:4) {#if isComplete && !isRevealing && showCompleteMessage}
-    function create_if_block_1$3(ctx) {
+    function create_if_block_1(ctx) {
     	let completedmessage;
     	let current;
 
@@ -6755,7 +7155,7 @@ var app = (function () {
     			const completedmessage_changes = {};
     			if (dirty[0] & /*showConfetti*/ 8) completedmessage_changes.showConfetti = /*showConfetti*/ ctx[3];
 
-    			if (dirty[1] & /*$$scope*/ 128) {
+    			if (dirty[1] & /*$$scope*/ 256) {
     				completedmessage_changes.$$scope = { dirty, ctx };
     			}
 
@@ -6777,7 +7177,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_1$3.name,
+    		id: create_if_block_1.name,
     		type: "if",
     		source: "(169:4) {#if isComplete && !isRevealing && showCompleteMessage}",
     		ctx
@@ -6806,12 +7206,13 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(h3, "class", "svelte-186p9qm");
-    			add_location(h3, file$a, 171, 10, 4775);
+    			add_location(h3, file$1, 171, 10, 4775);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, h3, anchor);
-    			append_dev(h3, t);
+    			insert_hydration_dev(target, h3, anchor);
+    			append_hydration_dev(h3, t);
     		},
+    		p: noop,
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(h3);
     		}
@@ -6831,8 +7232,8 @@ var app = (function () {
     // (170:6) <CompletedMessage showConfetti="{showConfetti}">
     function create_default_slot(ctx) {
     	let current;
-    	const message_slot_template = /*#slots*/ ctx[30].message;
-    	const message_slot = create_slot(message_slot_template, ctx, /*$$scope*/ ctx[38], get_message_slot_context);
+    	const message_slot_template = /*#slots*/ ctx[31].message;
+    	const message_slot = create_slot(message_slot_template, ctx, /*$$scope*/ ctx[39], get_message_slot_context);
     	const message_slot_or_fallback = message_slot || fallback_block(ctx);
 
     	const block = {
@@ -6851,8 +7252,17 @@ var app = (function () {
     		},
     		p: function update(ctx, dirty) {
     			if (message_slot) {
-    				if (message_slot.p && dirty[1] & /*$$scope*/ 128) {
-    					update_slot(message_slot, message_slot_template, ctx, /*$$scope*/ ctx[38], dirty, get_message_slot_changes, get_message_slot_context);
+    				if (message_slot.p && (!current || dirty[1] & /*$$scope*/ 256)) {
+    					update_slot_base(
+    						message_slot,
+    						message_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[39],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[39])
+    						: get_slot_changes(message_slot_template, /*$$scope*/ ctx[39], dirty, get_message_slot_changes),
+    						get_message_slot_context
+    					);
     				}
     			}
     		},
@@ -6881,10 +7291,10 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$a(ctx) {
+    function create_fragment$1(ctx) {
     	let if_block_anchor;
     	let current;
-    	let if_block = /*validated*/ ctx[12] && create_if_block$5(ctx);
+    	let if_block = /*validated*/ ctx[15] && create_if_block(ctx);
 
     	const block = {
     		c: function create() {
@@ -6897,19 +7307,19 @@ var app = (function () {
     		},
     		m: function mount(target, anchor) {
     			if (if_block) if_block.m(target, anchor);
-    			insert_dev(target, if_block_anchor, anchor);
+    			insert_hydration_dev(target, if_block_anchor, anchor);
     			current = true;
     		},
     		p: function update(ctx, dirty) {
-    			if (/*validated*/ ctx[12]) {
+    			if (/*validated*/ ctx[15]) {
     				if (if_block) {
     					if_block.p(ctx, dirty);
 
-    					if (dirty[0] & /*validated*/ 4096) {
+    					if (dirty[0] & /*validated*/ 32768) {
     						transition_in(if_block, 1);
     					}
     				} else {
-    					if_block = create_if_block$5(ctx);
+    					if_block = create_if_block(ctx);
     					if_block.c();
     					transition_in(if_block, 1);
     					if_block.m(if_block_anchor.parentNode, if_block_anchor);
@@ -6941,7 +7351,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$a.name,
+    		id: create_fragment$1.name,
     		type: "component",
     		source: "",
     		ctx
@@ -6950,9 +7360,16 @@ var app = (function () {
     	return block;
     }
 
-    function instance$a($$self, $$props, $$invalidate) {
+    function instance$1($$self, $$props, $$invalidate) {
+    	let focusedCell;
+    	let cellIndexMap;
+    	let percentCorrect;
+    	let isComplete;
+    	let isDisableHighlight;
+    	let stacked;
+    	let inlineStyles;
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Crossword", slots, ['toolbar','message']);
+    	validate_slots('Crossword', slots, ['toolbar','message']);
     	let { data = [] } = $$props;
     	let { actions = ["clear", "reveal", "check"] } = $$props;
     	let { theme = "classic" } = $$props;
@@ -6979,19 +7396,19 @@ var app = (function () {
 
     	const onDataUpdate = () => {
     		originalClues = createClues(data);
-    		$$invalidate(12, validated = validateClues(originalClues));
-    		$$invalidate(13, clues = originalClues.map(d => ({ ...d })));
-    		$$invalidate(14, cells = createCells(originalClues));
+    		$$invalidate(15, validated = validateClues(originalClues));
+    		$$invalidate(8, clues = originalClues.map(d => ({ ...d })));
+    		$$invalidate(9, cells = createCells(originalClues));
     		reset();
     	};
 
     	onMount(() => {
-    		$$invalidate(10, isLoaded = true);
+    		$$invalidate(13, isLoaded = true);
     	});
 
     	function checkClues() {
     		return clues.map(d => {
-    			const index = d.index;
+    			d.index;
 
     			const cellChecks = d.cells.map(c => {
     				const { value } = cells.find(e => e.id === c.id);
@@ -7007,37 +7424,37 @@ var app = (function () {
     	}
 
     	function reset() {
-    		$$invalidate(9, isRevealing = false);
-    		$$invalidate(11, isChecking = false);
-    		$$invalidate(8, focusedCellIndex = 0);
-    		$$invalidate(7, focusedDirection = "across");
+    		$$invalidate(12, isRevealing = false);
+    		$$invalidate(14, isChecking = false);
+    		$$invalidate(7, focusedCellIndex = 0);
+    		$$invalidate(11, focusedDirection = "across");
     	}
 
     	function onClear() {
     		reset();
     		if (revealTimeout) clearTimeout(revealTimeout);
-    		$$invalidate(14, cells = cells.map(cell => ({ ...cell, value: "" })));
+    		$$invalidate(9, cells = cells.map(cell => ({ ...cell, value: "" })));
     	}
 
     	function onReveal() {
     		if (revealed) return true;
     		reset();
-    		$$invalidate(14, cells = cells.map(cell => ({ ...cell, value: cell.answer })));
+    		$$invalidate(9, cells = cells.map(cell => ({ ...cell, value: cell.answer })));
     		startReveal();
     	}
 
     	function onCheck() {
-    		$$invalidate(11, isChecking = true);
+    		$$invalidate(14, isChecking = true);
     	}
 
     	function startReveal() {
-    		$$invalidate(9, isRevealing = true);
-    		$$invalidate(11, isChecking = false);
+    		$$invalidate(12, isRevealing = true);
+    		$$invalidate(14, isChecking = false);
     		if (revealTimeout) clearTimeout(revealTimeout);
 
     		revealTimeout = setTimeout(
     			() => {
-    				$$invalidate(9, isRevealing = false);
+    				$$invalidate(12, isRevealing = false);
     			},
     			revealDuration + 250
     		);
@@ -7047,52 +7464,58 @@ var app = (function () {
     		if (detail === "clear") onClear(); else if (detail === "reveal") onReveal(); else if (detail === "check") onCheck();
     	}
 
+    	$$self.$$.on_mount.push(function () {
+    		if (showKeyboard === undefined && !('showKeyboard' in $$props || $$self.$$.bound[$$self.$$.props['showKeyboard']])) {
+    			console.warn("<Crossword> was created without expected prop 'showKeyboard'");
+    		}
+    	});
+
     	const writable_props = [
-    		"data",
-    		"actions",
-    		"theme",
-    		"revealDuration",
-    		"breakpoint",
-    		"revealed",
-    		"disableHighlight",
-    		"showCompleteMessage",
-    		"showConfetti",
-    		"showKeyboard",
-    		"keyboardStyle"
+    		'data',
+    		'actions',
+    		'theme',
+    		'revealDuration',
+    		'breakpoint',
+    		'revealed',
+    		'disableHighlight',
+    		'showCompleteMessage',
+    		'showConfetti',
+    		'showKeyboard',
+    		'keyboardStyle'
     	];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Crossword> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Crossword> was created with unknown prop '${key}'`);
     	});
 
     	function clues_1_focusedCellIndex_binding(value) {
     		focusedCellIndex = value;
-    		$$invalidate(8, focusedCellIndex);
+    		$$invalidate(7, focusedCellIndex);
     	}
 
     	function clues_1_focusedCell_binding(value) {
     		focusedCell = value;
-    		(($$invalidate(15, focusedCell), $$invalidate(14, cells)), $$invalidate(8, focusedCellIndex));
+    		(($$invalidate(20, focusedCell), $$invalidate(9, cells)), $$invalidate(7, focusedCellIndex));
     	}
 
     	function clues_1_focusedDirection_binding(value) {
     		focusedDirection = value;
-    		$$invalidate(7, focusedDirection);
+    		$$invalidate(11, focusedDirection);
     	}
 
     	function puzzle_cells_binding(value) {
     		cells = value;
-    		$$invalidate(14, cells);
+    		$$invalidate(9, cells);
     	}
 
     	function puzzle_focusedCellIndex_binding(value) {
     		focusedCellIndex = value;
-    		$$invalidate(8, focusedCellIndex);
+    		$$invalidate(7, focusedCellIndex);
     	}
 
     	function puzzle_focusedDirection_binding(value) {
     		focusedDirection = value;
-    		$$invalidate(7, focusedDirection);
+    		$$invalidate(11, focusedDirection);
     	}
 
     	function article_elementresize_handler() {
@@ -7101,18 +7524,18 @@ var app = (function () {
     	}
 
     	$$self.$$set = $$props => {
-    		if ("data" in $$props) $$invalidate(26, data = $$props.data);
-    		if ("actions" in $$props) $$invalidate(0, actions = $$props.actions);
-    		if ("theme" in $$props) $$invalidate(27, theme = $$props.theme);
-    		if ("revealDuration" in $$props) $$invalidate(1, revealDuration = $$props.revealDuration);
-    		if ("breakpoint" in $$props) $$invalidate(28, breakpoint = $$props.breakpoint);
-    		if ("revealed" in $$props) $$invalidate(25, revealed = $$props.revealed);
-    		if ("disableHighlight" in $$props) $$invalidate(29, disableHighlight = $$props.disableHighlight);
-    		if ("showCompleteMessage" in $$props) $$invalidate(2, showCompleteMessage = $$props.showCompleteMessage);
-    		if ("showConfetti" in $$props) $$invalidate(3, showConfetti = $$props.showConfetti);
-    		if ("showKeyboard" in $$props) $$invalidate(4, showKeyboard = $$props.showKeyboard);
-    		if ("keyboardStyle" in $$props) $$invalidate(5, keyboardStyle = $$props.keyboardStyle);
-    		if ("$$scope" in $$props) $$invalidate(38, $$scope = $$props.$$scope);
+    		if ('data' in $$props) $$invalidate(26, data = $$props.data);
+    		if ('actions' in $$props) $$invalidate(0, actions = $$props.actions);
+    		if ('theme' in $$props) $$invalidate(27, theme = $$props.theme);
+    		if ('revealDuration' in $$props) $$invalidate(1, revealDuration = $$props.revealDuration);
+    		if ('breakpoint' in $$props) $$invalidate(28, breakpoint = $$props.breakpoint);
+    		if ('revealed' in $$props) $$invalidate(25, revealed = $$props.revealed);
+    		if ('disableHighlight' in $$props) $$invalidate(29, disableHighlight = $$props.disableHighlight);
+    		if ('showCompleteMessage' in $$props) $$invalidate(2, showCompleteMessage = $$props.showCompleteMessage);
+    		if ('showConfetti' in $$props) $$invalidate(3, showConfetti = $$props.showConfetti);
+    		if ('showKeyboard' in $$props) $$invalidate(4, showKeyboard = $$props.showKeyboard);
+    		if ('keyboardStyle' in $$props) $$invalidate(5, keyboardStyle = $$props.keyboardStyle);
+    		if ('$$scope' in $$props) $$invalidate(39, $$scope = $$props.$$scope);
     	};
 
     	$$self.$capture_state = () => ({
@@ -7157,55 +7580,47 @@ var app = (function () {
     		onCheck,
     		startReveal,
     		onToolbarEvent,
-    		focusedCell,
-    		cellIndexMap,
-    		percentCorrect,
+    		inlineStyles,
+    		stacked,
     		isComplete,
     		isDisableHighlight,
-    		stacked,
-    		inlineStyles
+    		percentCorrect,
+    		cellIndexMap,
+    		focusedCell
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("data" in $$props) $$invalidate(26, data = $$props.data);
-    		if ("actions" in $$props) $$invalidate(0, actions = $$props.actions);
-    		if ("theme" in $$props) $$invalidate(27, theme = $$props.theme);
-    		if ("revealDuration" in $$props) $$invalidate(1, revealDuration = $$props.revealDuration);
-    		if ("breakpoint" in $$props) $$invalidate(28, breakpoint = $$props.breakpoint);
-    		if ("revealed" in $$props) $$invalidate(25, revealed = $$props.revealed);
-    		if ("disableHighlight" in $$props) $$invalidate(29, disableHighlight = $$props.disableHighlight);
-    		if ("showCompleteMessage" in $$props) $$invalidate(2, showCompleteMessage = $$props.showCompleteMessage);
-    		if ("showConfetti" in $$props) $$invalidate(3, showConfetti = $$props.showConfetti);
-    		if ("showKeyboard" in $$props) $$invalidate(4, showKeyboard = $$props.showKeyboard);
-    		if ("keyboardStyle" in $$props) $$invalidate(5, keyboardStyle = $$props.keyboardStyle);
-    		if ("width" in $$props) $$invalidate(6, width = $$props.width);
-    		if ("focusedDirection" in $$props) $$invalidate(7, focusedDirection = $$props.focusedDirection);
-    		if ("focusedCellIndex" in $$props) $$invalidate(8, focusedCellIndex = $$props.focusedCellIndex);
-    		if ("isRevealing" in $$props) $$invalidate(9, isRevealing = $$props.isRevealing);
-    		if ("isLoaded" in $$props) $$invalidate(10, isLoaded = $$props.isLoaded);
-    		if ("isChecking" in $$props) $$invalidate(11, isChecking = $$props.isChecking);
-    		if ("revealTimeout" in $$props) revealTimeout = $$props.revealTimeout;
-    		if ("clueCompletion" in $$props) clueCompletion = $$props.clueCompletion;
-    		if ("originalClues" in $$props) originalClues = $$props.originalClues;
-    		if ("validated" in $$props) $$invalidate(12, validated = $$props.validated);
-    		if ("clues" in $$props) $$invalidate(13, clues = $$props.clues);
-    		if ("cells" in $$props) $$invalidate(14, cells = $$props.cells);
-    		if ("focusedCell" in $$props) $$invalidate(15, focusedCell = $$props.focusedCell);
-    		if ("cellIndexMap" in $$props) $$invalidate(16, cellIndexMap = $$props.cellIndexMap);
-    		if ("percentCorrect" in $$props) $$invalidate(41, percentCorrect = $$props.percentCorrect);
-    		if ("isComplete" in $$props) $$invalidate(17, isComplete = $$props.isComplete);
-    		if ("isDisableHighlight" in $$props) $$invalidate(18, isDisableHighlight = $$props.isDisableHighlight);
-    		if ("stacked" in $$props) $$invalidate(19, stacked = $$props.stacked);
-    		if ("inlineStyles" in $$props) $$invalidate(20, inlineStyles = $$props.inlineStyles);
+    		if ('data' in $$props) $$invalidate(26, data = $$props.data);
+    		if ('actions' in $$props) $$invalidate(0, actions = $$props.actions);
+    		if ('theme' in $$props) $$invalidate(27, theme = $$props.theme);
+    		if ('revealDuration' in $$props) $$invalidate(1, revealDuration = $$props.revealDuration);
+    		if ('breakpoint' in $$props) $$invalidate(28, breakpoint = $$props.breakpoint);
+    		if ('revealed' in $$props) $$invalidate(25, revealed = $$props.revealed);
+    		if ('disableHighlight' in $$props) $$invalidate(29, disableHighlight = $$props.disableHighlight);
+    		if ('showCompleteMessage' in $$props) $$invalidate(2, showCompleteMessage = $$props.showCompleteMessage);
+    		if ('showConfetti' in $$props) $$invalidate(3, showConfetti = $$props.showConfetti);
+    		if ('showKeyboard' in $$props) $$invalidate(4, showKeyboard = $$props.showKeyboard);
+    		if ('keyboardStyle' in $$props) $$invalidate(5, keyboardStyle = $$props.keyboardStyle);
+    		if ('width' in $$props) $$invalidate(6, width = $$props.width);
+    		if ('focusedDirection' in $$props) $$invalidate(11, focusedDirection = $$props.focusedDirection);
+    		if ('focusedCellIndex' in $$props) $$invalidate(7, focusedCellIndex = $$props.focusedCellIndex);
+    		if ('isRevealing' in $$props) $$invalidate(12, isRevealing = $$props.isRevealing);
+    		if ('isLoaded' in $$props) $$invalidate(13, isLoaded = $$props.isLoaded);
+    		if ('isChecking' in $$props) $$invalidate(14, isChecking = $$props.isChecking);
+    		if ('revealTimeout' in $$props) revealTimeout = $$props.revealTimeout;
+    		if ('clueCompletion' in $$props) clueCompletion = $$props.clueCompletion;
+    		if ('originalClues' in $$props) originalClues = $$props.originalClues;
+    		if ('validated' in $$props) $$invalidate(15, validated = $$props.validated);
+    		if ('clues' in $$props) $$invalidate(8, clues = $$props.clues);
+    		if ('cells' in $$props) $$invalidate(9, cells = $$props.cells);
+    		if ('inlineStyles' in $$props) $$invalidate(16, inlineStyles = $$props.inlineStyles);
+    		if ('stacked' in $$props) $$invalidate(17, stacked = $$props.stacked);
+    		if ('isComplete' in $$props) $$invalidate(10, isComplete = $$props.isComplete);
+    		if ('isDisableHighlight' in $$props) $$invalidate(18, isDisableHighlight = $$props.isDisableHighlight);
+    		if ('percentCorrect' in $$props) $$invalidate(30, percentCorrect = $$props.percentCorrect);
+    		if ('cellIndexMap' in $$props) $$invalidate(19, cellIndexMap = $$props.cellIndexMap);
+    		if ('focusedCell' in $$props) $$invalidate(20, focusedCell = $$props.focusedCell);
     	};
-
-    	let focusedCell;
-    	let cellIndexMap;
-    	let percentCorrect;
-    	let isComplete;
-    	let isDisableHighlight;
-    	let stacked;
-    	let inlineStyles;
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
@@ -7213,43 +7628,43 @@ var app = (function () {
 
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty[0] & /*data*/ 67108864) {
-    			 (onDataUpdate());
+    			(onDataUpdate());
     		}
 
-    		if ($$self.$$.dirty[0] & /*cells, focusedCellIndex*/ 16640) {
-    			 $$invalidate(15, focusedCell = cells[focusedCellIndex] || {});
+    		if ($$self.$$.dirty[0] & /*cells, focusedCellIndex*/ 640) {
+    			$$invalidate(20, focusedCell = cells[focusedCellIndex] || {});
     		}
 
-    		if ($$self.$$.dirty[0] & /*cells*/ 16384) {
-    			 $$invalidate(16, cellIndexMap = fromPairs(cells.map(cell => [cell.id, cell.index])));
+    		if ($$self.$$.dirty[0] & /*cells*/ 512) {
+    			$$invalidate(19, cellIndexMap = fromPairs(cells.map(cell => [cell.id, cell.index])));
     		}
 
-    		if ($$self.$$.dirty[0] & /*cells*/ 16384) {
-    			 $$invalidate(41, percentCorrect = cells.filter(d => d.answer === d.value).length / cells.length);
+    		if ($$self.$$.dirty[0] & /*cells*/ 512) {
+    			$$invalidate(30, percentCorrect = cells.filter(d => d.answer === d.value).length / cells.length);
     		}
 
-    		if ($$self.$$.dirty[1] & /*percentCorrect*/ 1024) {
-    			 $$invalidate(17, isComplete = percentCorrect == 1);
+    		if ($$self.$$.dirty[0] & /*percentCorrect*/ 1073741824) {
+    			$$invalidate(10, isComplete = percentCorrect == 1);
     		}
 
-    		if ($$self.$$.dirty[0] & /*isComplete, disableHighlight*/ 537001984) {
-    			 $$invalidate(18, isDisableHighlight = isComplete && disableHighlight);
+    		if ($$self.$$.dirty[0] & /*isComplete, disableHighlight*/ 536871936) {
+    			$$invalidate(18, isDisableHighlight = isComplete && disableHighlight);
     		}
 
-    		if ($$self.$$.dirty[0] & /*cells*/ 16384) {
-    			 ($$invalidate(13, clues = checkClues()));
+    		if ($$self.$$.dirty[0] & /*cells*/ 512) {
+    			($$invalidate(8, clues = checkClues()));
     		}
 
-    		if ($$self.$$.dirty[0] & /*cells, clues*/ 24576) {
-    			 ($$invalidate(25, revealed = !clues.filter(d => !d.isCorrect).length));
+    		if ($$self.$$.dirty[0] & /*cells, clues*/ 768) {
+    			($$invalidate(25, revealed = !clues.filter(d => !d.isCorrect).length));
     		}
 
     		if ($$self.$$.dirty[0] & /*width, breakpoint*/ 268435520) {
-    			 $$invalidate(19, stacked = width < breakpoint);
+    			$$invalidate(17, stacked = width < breakpoint);
     		}
 
     		if ($$self.$$.dirty[0] & /*theme*/ 134217728) {
-    			 $$invalidate(20, inlineStyles = themes[theme]);
+    			$$invalidate(16, inlineStyles = themes[theme]);
     		}
     	};
 
@@ -7261,20 +7676,20 @@ var app = (function () {
     		showKeyboard,
     		keyboardStyle,
     		width,
-    		focusedDirection,
     		focusedCellIndex,
+    		clues,
+    		cells,
+    		isComplete,
+    		focusedDirection,
     		isRevealing,
     		isLoaded,
     		isChecking,
     		validated,
-    		clues,
-    		cells,
-    		focusedCell,
-    		cellIndexMap,
-    		isComplete,
-    		isDisableHighlight,
-    		stacked,
     		inlineStyles,
+    		stacked,
+    		isDisableHighlight,
+    		cellIndexMap,
+    		focusedCell,
     		onClear,
     		onReveal,
     		onCheck,
@@ -7284,6 +7699,7 @@ var app = (function () {
     		theme,
     		breakpoint,
     		disableHighlight,
+    		percentCorrect,
     		slots,
     		clues_1_focusedCellIndex_binding,
     		clues_1_focusedCell_binding,
@@ -7303,8 +7719,8 @@ var app = (function () {
     		init(
     			this,
     			options,
-    			instance$a,
-    			create_fragment$a,
+    			instance$1,
+    			create_fragment$1,
     			safe_not_equal,
     			{
     				data: 26,
@@ -7319,6 +7735,7 @@ var app = (function () {
     				showKeyboard: 4,
     				keyboardStyle: 5
     			},
+    			null,
     			[-1, -1]
     		);
 
@@ -7326,15 +7743,8 @@ var app = (function () {
     			component: this,
     			tagName: "Crossword",
     			options,
-    			id: create_fragment$a.name
+    			id: create_fragment$1.name
     		});
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-
-    		if (/*showKeyboard*/ ctx[4] === undefined && !("showKeyboard" in props)) {
-    			console.warn("<Crossword> was created without expected prop 'showKeyboard'");
-    		}
     	}
 
     	get data() {
@@ -8268,10 +8678,10 @@ var app = (function () {
     	}
     ];
 
-    /* App.svelte generated by Svelte v3.29.0 */
-    const file$b = "App.svelte";
+    /* App.svelte generated by Svelte v3.59.2 */
+    const file = "App.svelte";
 
-    // (96:6) <div         class="toolbar"         slot="toolbar"         let:onClear         let:onReveal         style="background: #333; padding: 1em; margin: 1em 0;"       >
+    // (96:6) 
     function create_toolbar_slot(ctx) {
     	let div;
     	let button0;
@@ -8311,25 +8721,25 @@ var app = (function () {
     			set_style(button0, "font-size", "1.5em");
     			set_style(button0, "background-color", "#888");
     			attr_dev(button0, "class", "svelte-18on4kq");
-    			add_location(button0, file$b, 102, 8, 2941);
+    			add_location(button0, file, 102, 8, 2939);
     			set_style(button1, "font-size", "1.5em");
     			set_style(button1, "background-color", "#888");
     			attr_dev(button1, "class", "svelte-18on4kq");
-    			add_location(button1, file$b, 106, 8, 3079);
+    			add_location(button1, file, 106, 8, 3077);
     			attr_dev(div, "class", "toolbar");
     			attr_dev(div, "slot", "toolbar");
     			set_style(div, "background", "#333");
     			set_style(div, "padding", "1em");
     			set_style(div, "margin", "1em 0");
-    			add_location(div, file$b, 95, 6, 2769);
+    			add_location(div, file, 95, 6, 2767);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
-    			append_dev(div, button0);
-    			append_dev(button0, t0);
-    			append_dev(div, t1);
-    			append_dev(div, button1);
-    			append_dev(button1, t2);
+    			insert_hydration_dev(target, div, anchor);
+    			append_hydration_dev(div, button0);
+    			append_hydration_dev(button0, t0);
+    			append_hydration_dev(div, t1);
+    			append_hydration_dev(div, button1);
+    			append_hydration_dev(button1, t2);
 
     			if (!mounted) {
     				dispose = [
@@ -8337,8 +8747,9 @@ var app = (function () {
     						button0,
     						"click",
     						function () {
-    							if (is_function(/*onClear*/ ctx[4])) /*onClear*/ ctx[4].apply(this, arguments);
+    							if (is_function(/*onClear*/ ctx[5])) /*onClear*/ ctx[5].apply(this, arguments);
     						},
+    						false,
     						false,
     						false,
     						false
@@ -8347,8 +8758,9 @@ var app = (function () {
     						button1,
     						"click",
     						function () {
-    							if (is_function(/*onReveal*/ ctx[5])) /*onReveal*/ ctx[5].apply(this, arguments);
+    							if (is_function(/*onReveal*/ ctx[4])) /*onReveal*/ ctx[4].apply(this, arguments);
     						},
+    						false,
     						false,
     						false,
     						false
@@ -8372,14 +8784,14 @@ var app = (function () {
     		block,
     		id: create_toolbar_slot.name,
     		type: "slot",
-    		source: "(96:6) <div         class=\\\"toolbar\\\"         slot=\\\"toolbar\\\"         let:onClear         let:onReveal         style=\\\"background: #333; padding: 1em; margin: 1em 0;\\\"       >",
+    		source: "(96:6) ",
     		ctx
     	});
 
     	return block;
     }
 
-    // (112:6) <div slot="message">
+    // (112:6) 
     function create_message_slot(ctx) {
     	let div;
     	let h3;
@@ -8410,20 +8822,21 @@ var app = (function () {
     			this.h();
     		},
     		h: function hydrate() {
-    			add_location(h3, file$b, 112, 8, 3258);
+    			add_location(h3, file, 112, 8, 3256);
     			attr_dev(img, "alt", "celebration");
-    			if (img.src !== (img_src_value = "https://media3.giphy.com/media/QpOZPQQ2wbjOM/giphy.gif")) attr_dev(img, "src", img_src_value);
-    			add_location(img, file$b, 113, 8, 3290);
+    			if (!src_url_equal(img.src, img_src_value = "https://media3.giphy.com/media/QpOZPQQ2wbjOM/giphy.gif")) attr_dev(img, "src", img_src_value);
+    			add_location(img, file, 113, 8, 3288);
     			attr_dev(div, "slot", "message");
-    			add_location(div, file$b, 111, 6, 3229);
+    			add_location(div, file, 111, 6, 3227);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
-    			append_dev(div, h3);
-    			append_dev(h3, t0);
-    			append_dev(div, t1);
-    			append_dev(div, img);
+    			insert_hydration_dev(target, div, anchor);
+    			append_hydration_dev(div, h3);
+    			append_hydration_dev(h3, t0);
+    			append_hydration_dev(div, t1);
+    			append_hydration_dev(div, img);
     		},
+    		p: noop,
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(div);
     		}
@@ -8433,45 +8846,14 @@ var app = (function () {
     		block,
     		id: create_message_slot.name,
     		type: "slot",
-    		source: "(112:6) <div slot=\\\"message\\\">",
+    		source: "(112:6) ",
     		ctx
     	});
 
     	return block;
     }
 
-    // (95:4) <Crossword data="{dataNYTDaily}">
-    function create_default_slot$1(ctx) {
-    	let t;
-
-    	const block = {
-    		c: function create() {
-    			t = space();
-    		},
-    		l: function claim(nodes) {
-    			t = claim_space(nodes);
-    		},
-    		m: function mount(target, anchor) {
-    			insert_dev(target, t, anchor);
-    		},
-    		p: noop,
-    		d: function destroy(detaching) {
-    			if (detaching) detach_dev(t);
-    		}
-    	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_default_slot$1.name,
-    		type: "slot",
-    		source: "(95:4) <Crossword data=\\\"{dataNYTDaily}\\\">",
-    		ctx
-    	});
-
-    	return block;
-    }
-
-    function create_fragment$b(ctx) {
+    function create_fragment(ctx) {
     	let article;
     	let div0;
     	let h1;
@@ -8591,7 +8973,7 @@ var app = (function () {
     		});
 
     	function crossword3_revealed_binding(value) {
-    		/*crossword3_revealed_binding*/ ctx[3].call(null, value);
+    		/*crossword3_revealed_binding*/ ctx[3](value);
     	}
 
     	let crossword3_props = {
@@ -8604,18 +8986,17 @@ var app = (function () {
     	}
 
     	crossword3 = new Crossword({ props: crossword3_props, $$inline: true });
-    	binding_callbacks.push(() => bind(crossword3, "revealed", crossword3_revealed_binding));
+    	binding_callbacks.push(() => bind(crossword3, 'revealed', crossword3_revealed_binding));
 
     	crossword4 = new Crossword({
     			props: {
     				data: dataNYTDaily,
     				$$slots: {
-    					default: [create_default_slot$1],
     					message: [create_message_slot],
     					toolbar: [
     						create_toolbar_slot,
-    						({ onClear, onReveal }) => ({ 4: onClear, 5: onReveal }),
-    						({ onClear, onReveal }) => (onClear ? 16 : 0) | (onReveal ? 32 : 0)
+    						({ onReveal, onClear }) => ({ 4: onReveal, 5: onClear }),
+    						({ onReveal, onClear }) => (onReveal ? 16 : 0) | (onClear ? 32 : 0)
     					]
     				},
     				$$scope: { ctx }
@@ -8831,19 +9212,19 @@ var app = (function () {
     			t29 = claim_space(div3_nodes);
     			select = claim_element(div3_nodes, "SELECT", {});
     			var select_nodes = children(select);
-    			option0 = claim_element(select_nodes, "OPTION", { value: true });
+    			option0 = claim_element(select_nodes, "OPTION", {});
     			var option0_nodes = children(option0);
     			t30 = claim_text(option0_nodes, "Classic");
     			option0_nodes.forEach(detach_dev);
-    			option1 = claim_element(select_nodes, "OPTION", { value: true });
+    			option1 = claim_element(select_nodes, "OPTION", {});
     			var option1_nodes = children(option1);
     			t31 = claim_text(option1_nodes, "Dark");
     			option1_nodes.forEach(detach_dev);
-    			option2 = claim_element(select_nodes, "OPTION", { value: true });
+    			option2 = claim_element(select_nodes, "OPTION", {});
     			var option2_nodes = children(option2);
     			t32 = claim_text(option2_nodes, "Citrus");
     			option2_nodes.forEach(detach_dev);
-    			option3 = claim_element(select_nodes, "OPTION", { value: true });
+    			option3 = claim_element(select_nodes, "OPTION", {});
     			var option3_nodes = children(option3);
     			t33 = claim_text(option3_nodes, "Amelia");
     			option3_nodes.forEach(detach_dev);
@@ -8912,208 +9293,208 @@ var app = (function () {
     		},
     		h: function hydrate() {
     			attr_dev(h1, "class", "svelte-18on4kq");
-    			add_location(h1, file$b, 13, 4, 326);
+    			add_location(h1, file, 13, 4, 326);
     			attr_dev(a0, "href", "https://svelte.dev");
-    			add_location(a0, file$b, 16, 6, 398);
+    			add_location(a0, file, 16, 6, 398);
     			attr_dev(a1, "href", "https://github.com/russellsamora/svelte-crossword#svelte-crossword");
-    			add_location(a1, file$b, 17, 6, 462);
+    			add_location(a1, file, 17, 6, 462);
     			attr_dev(a2, "href", "https://twitter.com/wattenberger");
-    			add_location(a2, file$b, 21, 6, 596);
+    			add_location(a2, file, 21, 6, 596);
     			attr_dev(a3, "href", "https://twitter.com/russellviz");
-    			add_location(a3, file$b, 23, 6, 679);
+    			add_location(a3, file, 23, 6, 679);
     			attr_dev(p0, "class", "svelte-18on4kq");
-    			add_location(p0, file$b, 14, 4, 356);
+    			add_location(p0, file, 14, 4, 356);
     			attr_dev(div0, "class", "intro svelte-18on4kq");
-    			add_location(div0, file$b, 12, 2, 302);
+    			add_location(div0, file, 12, 2, 302);
     			attr_dev(a4, "href", "#default");
     			attr_dev(a4, "class", "svelte-18on4kq");
-    			add_location(a4, file$b, 29, 10, 817);
+    			add_location(a4, file, 29, 10, 817);
     			attr_dev(h20, "class", "svelte-18on4kq");
-    			add_location(h20, file$b, 29, 6, 813);
+    			add_location(h20, file, 29, 6, 813);
     			attr_dev(a5, "href", "https://www.nytimes.com/crosswords/game/daily/2020/10/21");
     			attr_dev(a5, "class", "svelte-18on4kq");
-    			add_location(a5, file$b, 32, 8, 889);
+    			add_location(a5, file, 32, 8, 889);
     			attr_dev(p1, "class", "svelte-18on4kq");
-    			add_location(p1, file$b, 30, 6, 867);
+    			add_location(p1, file, 30, 6, 867);
     			attr_dev(div1, "class", "info svelte-18on4kq");
-    			add_location(div1, file$b, 28, 4, 788);
+    			add_location(div1, file, 28, 4, 788);
     			attr_dev(section0, "id", "default");
     			attr_dev(section0, "class", "svelte-18on4kq");
-    			add_location(section0, file$b, 27, 2, 761);
+    			add_location(section0, file, 27, 2, 761);
     			attr_dev(a6, "href", "#mobile");
     			attr_dev(a6, "class", "svelte-18on4kq");
-    			add_location(a6, file$b, 43, 10, 1191);
+    			add_location(a6, file, 43, 10, 1191);
     			attr_dev(h21, "class", "svelte-18on4kq");
-    			add_location(h21, file$b, 43, 6, 1187);
+    			add_location(h21, file, 43, 6, 1187);
     			attr_dev(a7, "href", "https://www.nytimes.com/crosswords/game/mini/2020/10/21");
     			attr_dev(a7, "class", "svelte-18on4kq");
-    			add_location(a7, file$b, 46, 8, 1253);
+    			add_location(a7, file, 46, 8, 1253);
     			attr_dev(p2, "class", "svelte-18on4kq");
-    			add_location(p2, file$b, 44, 6, 1231);
+    			add_location(p2, file, 44, 6, 1231);
     			attr_dev(div2, "class", "info svelte-18on4kq");
-    			add_location(div2, file$b, 42, 4, 1162);
+    			add_location(div2, file, 42, 4, 1162);
     			attr_dev(section1, "id", "mobile");
     			set_style(section1, "max-width", "500px");
     			attr_dev(section1, "class", "svelte-18on4kq");
-    			add_location(section1, file$b, 41, 2, 1110);
+    			add_location(section1, file, 41, 2, 1110);
     			attr_dev(a8, "href", "#themes");
     			attr_dev(a8, "class", "svelte-18on4kq");
-    			add_location(a8, file$b, 57, 10, 1613);
+    			add_location(a8, file, 57, 10, 1611);
     			attr_dev(h22, "class", "svelte-18on4kq");
-    			add_location(h22, file$b, 57, 6, 1609);
+    			add_location(h22, file, 57, 6, 1607);
     			attr_dev(p3, "class", "svelte-18on4kq");
-    			add_location(p3, file$b, 58, 6, 1653);
+    			add_location(p3, file, 58, 6, 1651);
     			option0.__value = "classic";
     			option0.value = option0.__value;
-    			add_location(option0, file$b, 60, 8, 1753);
+    			add_location(option0, file, 60, 8, 1751);
     			option1.__value = "dark";
     			option1.value = option1.__value;
-    			add_location(option1, file$b, 61, 8, 1802);
+    			add_location(option1, file, 61, 8, 1800);
     			option2.__value = "citrus";
     			option2.value = option2.__value;
-    			add_location(option2, file$b, 62, 8, 1845);
+    			add_location(option2, file, 62, 8, 1843);
     			option3.__value = "amelia";
     			option3.value = option3.__value;
-    			add_location(option3, file$b, 63, 8, 1892);
+    			add_location(option3, file, 63, 8, 1890);
     			if (/*theme*/ ctx[1] === void 0) add_render_callback(() => /*select_change_handler*/ ctx[2].call(select));
-    			add_location(select, file$b, 59, 6, 1715);
+    			add_location(select, file, 59, 6, 1713);
     			attr_dev(div3, "class", "info svelte-18on4kq");
-    			add_location(div3, file$b, 56, 4, 1584);
-    			add_location(div4, file$b, 66, 4, 1962);
+    			add_location(div3, file, 56, 4, 1582);
+    			add_location(div4, file, 66, 4, 1960);
     			attr_dev(section2, "id", "themes");
     			attr_dev(section2, "class", section2_class_value = "" + (null_to_empty(/*theme*/ ctx[1]) + " svelte-18on4kq"));
     			set_style(section2, "max-width", "760px");
-    			add_location(section2, file$b, 55, 2, 1516);
+    			add_location(section2, file, 55, 2, 1514);
     			attr_dev(a9, "href", "#simple");
     			attr_dev(a9, "class", "svelte-18on4kq");
-    			add_location(a9, file$b, 73, 10, 2152);
+    			add_location(a9, file, 73, 10, 2150);
     			attr_dev(h23, "class", "svelte-18on4kq");
-    			add_location(h23, file$b, 73, 6, 2148);
+    			add_location(h23, file, 73, 6, 2146);
     			attr_dev(code0, "class", "svelte-18on4kq");
-    			add_location(code0, file$b, 76, 8, 2283);
+    			add_location(code0, file, 76, 8, 2281);
     			attr_dev(code1, "class", "svelte-18on4kq");
-    			add_location(code1, file$b, 78, 8, 2355);
+    			add_location(code1, file, 78, 8, 2353);
     			attr_dev(p4, "class", "svelte-18on4kq");
-    			add_location(p4, file$b, 74, 6, 2206);
+    			add_location(p4, file, 74, 6, 2204);
     			attr_dev(div5, "class", "info svelte-18on4kq");
-    			add_location(div5, file$b, 72, 4, 2123);
+    			add_location(div5, file, 72, 4, 2121);
     			attr_dev(section3, "id", "simple-customization");
     			attr_dev(section3, "class", "svelte-18on4kq");
     			toggle_class(section3, "is-revealed", /*revealedUSA*/ ctx[0]);
-    			add_location(section3, file$b, 71, 2, 2049);
+    			add_location(section3, file, 71, 2, 2047);
     			attr_dev(a10, "href", "#slots");
     			attr_dev(a10, "class", "svelte-18on4kq");
-    			add_location(a10, file$b, 91, 10, 2616);
+    			add_location(a10, file, 91, 10, 2614);
     			attr_dev(h24, "class", "svelte-18on4kq");
-    			add_location(h24, file$b, 91, 6, 2612);
+    			add_location(h24, file, 91, 6, 2610);
     			attr_dev(p5, "class", "svelte-18on4kq");
-    			add_location(p5, file$b, 92, 6, 2654);
+    			add_location(p5, file, 92, 6, 2652);
     			attr_dev(div6, "class", "info svelte-18on4kq");
-    			add_location(div6, file$b, 90, 4, 2587);
+    			add_location(div6, file, 90, 4, 2585);
     			attr_dev(section4, "id", "slots");
     			attr_dev(section4, "class", "svelte-18on4kq");
-    			add_location(section4, file$b, 89, 2, 2562);
+    			add_location(section4, file, 89, 2, 2560);
     			attr_dev(article, "class", "svelte-18on4kq");
-    			add_location(article, file$b, 11, 0, 290);
+    			add_location(article, file, 11, 0, 290);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, article, anchor);
-    			append_dev(article, div0);
-    			append_dev(div0, h1);
-    			append_dev(h1, t0);
-    			append_dev(div0, t1);
-    			append_dev(div0, p0);
-    			append_dev(p0, t2);
-    			append_dev(p0, a0);
-    			append_dev(a0, t3);
-    			append_dev(p0, t4);
-    			append_dev(p0, a1);
-    			append_dev(a1, t5);
-    			append_dev(p0, t6);
-    			append_dev(p0, a2);
-    			append_dev(a2, t7);
-    			append_dev(p0, t8);
-    			append_dev(p0, a3);
-    			append_dev(a3, t9);
-    			append_dev(p0, t10);
-    			append_dev(article, t11);
-    			append_dev(article, section0);
-    			append_dev(section0, div1);
-    			append_dev(div1, h20);
-    			append_dev(h20, a4);
-    			append_dev(a4, t12);
-    			append_dev(div1, t13);
-    			append_dev(div1, p1);
-    			append_dev(p1, t14);
-    			append_dev(p1, a5);
-    			append_dev(a5, t15);
-    			append_dev(p1, t16);
-    			append_dev(section0, t17);
+    			insert_hydration_dev(target, article, anchor);
+    			append_hydration_dev(article, div0);
+    			append_hydration_dev(div0, h1);
+    			append_hydration_dev(h1, t0);
+    			append_hydration_dev(div0, t1);
+    			append_hydration_dev(div0, p0);
+    			append_hydration_dev(p0, t2);
+    			append_hydration_dev(p0, a0);
+    			append_hydration_dev(a0, t3);
+    			append_hydration_dev(p0, t4);
+    			append_hydration_dev(p0, a1);
+    			append_hydration_dev(a1, t5);
+    			append_hydration_dev(p0, t6);
+    			append_hydration_dev(p0, a2);
+    			append_hydration_dev(a2, t7);
+    			append_hydration_dev(p0, t8);
+    			append_hydration_dev(p0, a3);
+    			append_hydration_dev(a3, t9);
+    			append_hydration_dev(p0, t10);
+    			append_hydration_dev(article, t11);
+    			append_hydration_dev(article, section0);
+    			append_hydration_dev(section0, div1);
+    			append_hydration_dev(div1, h20);
+    			append_hydration_dev(h20, a4);
+    			append_hydration_dev(a4, t12);
+    			append_hydration_dev(div1, t13);
+    			append_hydration_dev(div1, p1);
+    			append_hydration_dev(p1, t14);
+    			append_hydration_dev(p1, a5);
+    			append_hydration_dev(a5, t15);
+    			append_hydration_dev(p1, t16);
+    			append_hydration_dev(section0, t17);
     			mount_component(crossword0, section0, null);
-    			append_dev(article, t18);
-    			append_dev(article, section1);
-    			append_dev(section1, div2);
-    			append_dev(div2, h21);
-    			append_dev(h21, a6);
-    			append_dev(a6, t19);
-    			append_dev(div2, t20);
-    			append_dev(div2, p2);
-    			append_dev(p2, t21);
-    			append_dev(p2, a7);
-    			append_dev(a7, t22);
-    			append_dev(p2, t23);
-    			append_dev(section1, t24);
+    			append_hydration_dev(article, t18);
+    			append_hydration_dev(article, section1);
+    			append_hydration_dev(section1, div2);
+    			append_hydration_dev(div2, h21);
+    			append_hydration_dev(h21, a6);
+    			append_hydration_dev(a6, t19);
+    			append_hydration_dev(div2, t20);
+    			append_hydration_dev(div2, p2);
+    			append_hydration_dev(p2, t21);
+    			append_hydration_dev(p2, a7);
+    			append_hydration_dev(a7, t22);
+    			append_hydration_dev(p2, t23);
+    			append_hydration_dev(section1, t24);
     			mount_component(crossword1, section1, null);
-    			append_dev(article, t25);
-    			append_dev(article, section2);
-    			append_dev(section2, div3);
-    			append_dev(div3, h22);
-    			append_dev(h22, a8);
-    			append_dev(a8, t26);
-    			append_dev(div3, t27);
-    			append_dev(div3, p3);
-    			append_dev(p3, t28);
-    			append_dev(div3, t29);
-    			append_dev(div3, select);
-    			append_dev(select, option0);
-    			append_dev(option0, t30);
-    			append_dev(select, option1);
-    			append_dev(option1, t31);
-    			append_dev(select, option2);
-    			append_dev(option2, t32);
-    			append_dev(select, option3);
-    			append_dev(option3, t33);
-    			select_option(select, /*theme*/ ctx[1]);
-    			append_dev(section2, t34);
-    			append_dev(section2, div4);
+    			append_hydration_dev(article, t25);
+    			append_hydration_dev(article, section2);
+    			append_hydration_dev(section2, div3);
+    			append_hydration_dev(div3, h22);
+    			append_hydration_dev(h22, a8);
+    			append_hydration_dev(a8, t26);
+    			append_hydration_dev(div3, t27);
+    			append_hydration_dev(div3, p3);
+    			append_hydration_dev(p3, t28);
+    			append_hydration_dev(div3, t29);
+    			append_hydration_dev(div3, select);
+    			append_hydration_dev(select, option0);
+    			append_hydration_dev(option0, t30);
+    			append_hydration_dev(select, option1);
+    			append_hydration_dev(option1, t31);
+    			append_hydration_dev(select, option2);
+    			append_hydration_dev(option2, t32);
+    			append_hydration_dev(select, option3);
+    			append_hydration_dev(option3, t33);
+    			select_option(select, /*theme*/ ctx[1], true);
+    			append_hydration_dev(section2, t34);
+    			append_hydration_dev(section2, div4);
     			mount_component(crossword2, div4, null);
-    			append_dev(article, t35);
-    			append_dev(article, section3);
-    			append_dev(section3, div5);
-    			append_dev(div5, h23);
-    			append_dev(h23, a9);
-    			append_dev(a9, t36);
-    			append_dev(div5, t37);
-    			append_dev(div5, p4);
-    			append_dev(p4, t38);
-    			append_dev(p4, code0);
-    			append_dev(code0, t39);
-    			append_dev(p4, t40);
-    			append_dev(p4, code1);
-    			append_dev(code1, t41);
-    			append_dev(p4, t42);
-    			append_dev(section3, t43);
+    			append_hydration_dev(article, t35);
+    			append_hydration_dev(article, section3);
+    			append_hydration_dev(section3, div5);
+    			append_hydration_dev(div5, h23);
+    			append_hydration_dev(h23, a9);
+    			append_hydration_dev(a9, t36);
+    			append_hydration_dev(div5, t37);
+    			append_hydration_dev(div5, p4);
+    			append_hydration_dev(p4, t38);
+    			append_hydration_dev(p4, code0);
+    			append_hydration_dev(code0, t39);
+    			append_hydration_dev(p4, t40);
+    			append_hydration_dev(p4, code1);
+    			append_hydration_dev(code1, t41);
+    			append_hydration_dev(p4, t42);
+    			append_hydration_dev(section3, t43);
     			mount_component(crossword3, section3, null);
-    			append_dev(article, t44);
-    			append_dev(article, section4);
-    			append_dev(section4, div6);
-    			append_dev(div6, h24);
-    			append_dev(h24, a10);
-    			append_dev(a10, t45);
-    			append_dev(div6, t46);
-    			append_dev(div6, p5);
-    			append_dev(p5, t47);
-    			append_dev(section4, t48);
+    			append_hydration_dev(article, t44);
+    			append_hydration_dev(article, section4);
+    			append_hydration_dev(section4, div6);
+    			append_hydration_dev(div6, h24);
+    			append_hydration_dev(h24, a10);
+    			append_hydration_dev(a10, t45);
+    			append_hydration_dev(div6, t46);
+    			append_hydration_dev(div6, p5);
+    			append_hydration_dev(p5, t47);
+    			append_hydration_dev(section4, t48);
     			mount_component(crossword4, section4, null);
     			current = true;
 
@@ -9146,7 +9527,7 @@ var app = (function () {
 
     			crossword3.$set(crossword3_changes);
 
-    			if (dirty & /*revealedUSA*/ 1) {
+    			if (!current || dirty & /*revealedUSA*/ 1) {
     				toggle_class(section3, "is-revealed", /*revealedUSA*/ ctx[0]);
     			}
 
@@ -9189,7 +9570,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$b.name,
+    		id: create_fragment.name,
     		type: "component",
     		source: "",
     		ctx
@@ -9198,15 +9579,15 @@ var app = (function () {
     	return block;
     }
 
-    function instance$b($$self, $$props, $$invalidate) {
+    function instance($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("App", slots, []);
+    	validate_slots('App', slots, []);
     	let revealedUSA;
     	let theme;
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<App> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<App> was created with unknown prop '${key}'`);
     	});
 
     	function select_change_handler() {
@@ -9230,8 +9611,8 @@ var app = (function () {
     	});
 
     	$$self.$inject_state = $$props => {
-    		if ("revealedUSA" in $$props) $$invalidate(0, revealedUSA = $$props.revealedUSA);
-    		if ("theme" in $$props) $$invalidate(1, theme = $$props.theme);
+    		if ('revealedUSA' in $$props) $$invalidate(0, revealedUSA = $$props.revealedUSA);
+    		if ('theme' in $$props) $$invalidate(1, theme = $$props.theme);
     	};
 
     	if ($$props && "$$inject" in $$props) {
@@ -9244,13 +9625,13 @@ var app = (function () {
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$b, create_fragment$b, safe_not_equal, {});
+    		init(this, options, instance, create_fragment, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "App",
     			options,
-    			id: create_fragment$b.name
+    			id: create_fragment.name
     		});
     	}
     }
@@ -9262,5 +9643,5 @@ var app = (function () {
 
     return app;
 
-}());
+})();
 //# sourceMappingURL=bundle.js.map
