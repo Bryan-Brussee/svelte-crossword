@@ -162,8 +162,17 @@ You can provide more fine-grained control over the toolbar and completion messag
 
 ## Development
 
+Download this fork and from the root directory:
+
+```
+npm i
+```
+
+And then navigate to the example directory, install like so, and run dev.
+
 ```
 cd example
+npm i
 npm run dev
 ```
 
